@@ -107,6 +107,221 @@
     {%- endfor -%}
 {%- endmacro %}
 
+{% macro doris__materialized_view_effective_properties() -%}
+    {%- set configured_properties = config.get('properties') -%}
+    {%- if configured_properties is none -%}
+        {%- set configured_properties = {} -%}
+    {%- elif configured_properties is not mapping -%}
+        {{ exceptions.raise_compiler_error(
+            "materialized view properties must be a dictionary."
+        ) }}
+    {%- endif -%}
+
+    {#-- Match the table materialization's replication_num convenience config
+         without mutating the dictionary held by dbt's model config. --#}
+    {%- set properties = {} -%}
+    {%- do properties.update(configured_properties) -%}
+    {%- set replication_num = config.get('replication_num') -%}
+    {%- if replication_num is not none -%}
+        {%- do properties.update({'replication_num': replication_num}) -%}
+    {%- endif -%}
+    {{ return(properties) }}
+{%- endmacro %}
+
+{% macro doris__materialized_view_is_identifier(value, allow_qualified=false) -%}
+    {#-- Doris identifiers contain letters, digits, dollar signs, underscores,
+         or a complete backtick-quoted segment. Function identifiers may have
+         one database qualifier. --#}
+    {%- set identifier = value | trim -%}
+    {%- set scan = namespace(
+        in_backticks=false,
+        escaped_backtick=false,
+        segment_started=false,
+        segment_closed=false,
+        segment_has_non_digit=false,
+        pending_whitespace=false,
+        dots=0,
+        valid=true
+    ) -%}
+    {%- for character in identifier -%}
+        {%- if scan.in_backticks -%}
+            {%- if scan.escaped_backtick -%}
+                {%- set scan.escaped_backtick = false -%}
+            {%- elif character == '`' -%}
+                {%- if not loop.last and identifier[loop.index] == '`' -%}
+                    {%- set scan.escaped_backtick = true -%}
+                {%- else -%}
+                    {%- set scan.in_backticks = false -%}
+                    {%- set scan.segment_closed = true -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- elif (
+            character in [' ', '\t', '\r', '\n']
+            and allow_qualified
+        ) -%}
+            {%- set scan.pending_whitespace = true -%}
+        {%- elif character == '`' -%}
+            {%- if scan.pending_whitespace and scan.segment_started -%}
+                {%- set scan.valid = false -%}
+            {%- endif -%}
+            {%- set scan.pending_whitespace = false -%}
+            {%- if scan.segment_started or scan.segment_closed -%}
+                {%- set scan.valid = false -%}
+            {%- else -%}
+                {%- set scan.in_backticks = true -%}
+                {%- set scan.segment_started = true -%}
+                {%- set scan.segment_has_non_digit = true -%}
+            {%- endif -%}
+        {%- elif character == '.' and allow_qualified -%}
+            {%- if (
+                not scan.segment_started
+                or not scan.segment_has_non_digit
+                or scan.dots >= 1
+            ) -%}
+                {%- set scan.valid = false -%}
+            {%- endif -%}
+            {%- set scan.pending_whitespace = false -%}
+            {%- set scan.dots = scan.dots + 1 -%}
+            {%- set scan.segment_started = false -%}
+            {%- set scan.segment_closed = false -%}
+            {%- set scan.segment_has_non_digit = false -%}
+        {%- elif (
+            character.isalnum()
+            or character in ['$', '_']
+            or not character.isascii()
+        ) -%}
+            {%- if scan.pending_whitespace and scan.segment_started -%}
+                {%- set scan.valid = false -%}
+            {%- endif -%}
+            {%- set scan.pending_whitespace = false -%}
+            {%- if scan.segment_closed -%}
+                {%- set scan.valid = false -%}
+            {%- else -%}
+                {%- set scan.segment_started = true -%}
+                {%- if character not in '0123456789' -%}
+                    {%- set scan.segment_has_non_digit = true -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- else -%}
+            {%- set scan.valid = false -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{ return(
+        scan.valid
+        and not scan.in_backticks
+        and scan.segment_started
+        and scan.segment_has_non_digit
+    ) }}
+{%- endmacro %}
+
+{% macro doris__materialized_view_is_partition_expression(expression) -%}
+    {#-- Match the top-level shape of Doris mvPartition:
+         identifier | functionCallExpression. Function arguments remain SQL and
+         are validated by Doris itself. --#}
+    {%- set scan = namespace(
+        depth=0,
+        quote=none,
+        escaped=false,
+        open_index=none,
+        close_index=none,
+        valid=true
+    ) -%}
+    {%- for character in expression -%}
+        {%- if scan.quote is not none -%}
+            {%- if scan.escaped -%}
+                {%- set scan.escaped = false -%}
+            {%- elif character == '\\' and scan.quote != '`' -%}
+                {%- set scan.escaped = true -%}
+            {%- elif character == scan.quote -%}
+                {%- if not loop.last and expression[loop.index] == scan.quote -%}
+                    {%- set scan.escaped = true -%}
+                {%- else -%}
+                    {%- set scan.quote = none -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- elif character in ["'", '"', '`'] -%}
+            {%- set scan.quote = character -%}
+        {%- elif character == '(' -%}
+            {%- if scan.depth == 0 -%}
+                {%- if scan.open_index is not none -%}
+                    {%- set scan.valid = false -%}
+                {%- else -%}
+                    {%- set scan.open_index = loop.index0 -%}
+                {%- endif -%}
+            {%- endif -%}
+            {%- set scan.depth = scan.depth + 1 -%}
+        {%- elif character == ')' -%}
+            {%- if scan.depth <= 0 -%}
+                {%- set scan.valid = false -%}
+            {%- else -%}
+                {%- set scan.depth = scan.depth - 1 -%}
+                {%- if scan.depth == 0 -%}
+                    {%- set scan.close_index = loop.index0 -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+
+    {%- if not scan.valid or scan.quote is not none or scan.depth != 0 -%}
+        {{ return(false) }}
+    {%- elif scan.open_index is none -%}
+        {{ return(doris__materialized_view_is_identifier(expression)) }}
+    {%- elif scan.close_index != expression | length - 1 -%}
+        {{ return(false) }}
+    {%- endif -%}
+
+    {%- set function_identifier = expression[:scan.open_index] | trim -%}
+    {{ return(
+        doris__materialized_view_is_identifier(
+            function_identifier,
+            allow_qualified=true
+        )
+    ) }}
+{%- endmacro %}
+
+{% macro doris__materialized_view_partition_expression() -%}
+    {%- set configured_partition = config.get('partition_by') -%}
+    {%- if configured_partition is none -%}
+        {{ return(none) }}
+    {%- elif configured_partition is string -%}
+        {%- set partitions = [configured_partition] -%}
+    {%- elif configured_partition is sequence and configured_partition is not mapping -%}
+        {%- set partitions = configured_partition -%}
+    {%- else -%}
+        {%- set partitions = [] -%}
+    {%- endif -%}
+
+    {%- if (
+        partitions | length != 1
+        or partitions[0] is not string
+        or not partitions[0] | trim
+    ) -%}
+        {{ exceptions.raise_compiler_error(
+            "materialized view partition_by must be a string or a list "
+            ~ "containing exactly one non-empty string."
+        ) }}
+    {%- endif -%}
+
+    {%- set partition = partitions[0] | trim -%}
+    {%- if (
+        ';' in partition
+        or '--' in partition
+        or '/*' in partition
+        or '*/' in partition
+    ) -%}
+        {{ exceptions.raise_compiler_error(
+            "materialized view partition_by contains unsafe SQL tokens."
+        ) }}
+    {%- endif -%}
+    {%- if not doris__materialized_view_is_partition_expression(partition) -%}
+        {{ exceptions.raise_compiler_error(
+            "materialized view partition_by must contain one Doris identifier "
+            ~ "or function call."
+        ) }}
+    {%- endif -%}
+    {{ return(partition) }}
+{%- endmacro %}
+
 {% macro doris__validate_materialized_view_ddl_config() -%}
     {% do doris__validate_materialized_view_identifier_config(
         'duplicate_key',
@@ -116,31 +331,8 @@
         'distributed_by',
         config.get('distributed_by')
     ) %}
-    {%- set partition_by = config.get('partition_by') -%}
-    {%- if partition_by is not none and partition_by is not string -%}
-        {{ exceptions.raise_compiler_error(
-            "materialized view partition_by must be a string."
-        ) }}
-    {%- endif -%}
-    {%- if (
-        partition_by
-        and (
-            ';' in partition_by
-            or '--' in partition_by
-            or '/*' in partition_by
-            or '*/' in partition_by
-        )
-    ) -%}
-        {{ exceptions.raise_compiler_error(
-            "materialized view partition_by contains unsafe SQL tokens."
-        ) }}
-    {%- endif -%}
-    {%- set properties = config.get('properties') -%}
-    {%- if properties is not none and properties is not mapping -%}
-        {{ exceptions.raise_compiler_error(
-            "materialized view properties must be a dictionary."
-        ) }}
-    {%- endif -%}
+    {% do doris__materialized_view_partition_expression() %}
+    {% do doris__materialized_view_effective_properties() %}
     {%- set refresh_on_run = config.get('refresh_on_run', false) -%}
     {%- if refresh_on_run is not boolean -%}
         {{ exceptions.raise_compiler_error(
@@ -223,7 +415,7 @@
 {%- endmacro %}
 
 {% macro doris__materialized_view_properties_clause() -%}
-    {%- set properties = config.get('properties') or {} -%}
+    {%- set properties = doris__materialized_view_effective_properties() -%}
     {%- if properties %}
         properties (
         {%- for property in properties | dictsort -%}
@@ -242,7 +434,10 @@
         'hash' if distributed_by else 'random'
     ) or 'random') | lower -%}
     {%- set schedule = config.get('refresh_schedule') or {} -%}
-    {%- set properties = config.get('properties') or {} -%}
+    {%- set partition_by =
+        doris__materialized_view_partition_expression()
+    -%}
+    {%- set properties = doris__materialized_view_effective_properties() -%}
     {%- set property_values = [] -%}
     {%- for property in properties | dictsort -%}
         {%- do property_values.append(property[0] ~ '=' ~ property[1]) -%}
@@ -256,7 +451,7 @@
         (schedule.get('unit', '') or '') | lower,
         schedule.get('start_time', ''),
         config.get('duplicate_key') or '',
-        config.get('partition_by') or '',
+        partition_by or '',
         distribution_type,
         distributed_by or '',
         config.get('buckets', 'auto'),
@@ -517,7 +712,9 @@
     {% do doris__validate_materialized_view_ddl_config() %}
     {%- set duplicate_key = config.get('duplicate_key') -%}
     {%- set pending_comment = doris__materialized_view_comment(sql) -%}
-    {%- set partition_by = config.get('partition_by') -%}
+    {%- set partition_by =
+        doris__materialized_view_partition_expression()
+    -%}
     create materialized view {{ relation }}
     build {{ build_mode }}
     {{ doris__materialized_view_refresh_clause() }}

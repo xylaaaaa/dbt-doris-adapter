@@ -108,6 +108,60 @@ DAILY_SALES_FAILING_POST_HOOK_SQL = DAILY_SALES_MV_SQL.replace(
     "    post_hook='select * from __dbt_missing_post_hook_table__'",
 )
 
+MV_TOP_LEVEL_REPLICATION_SQL = """
+{{ config(
+    materialized='materialized_view',
+    build_mode='deferred',
+    refresh_method='complete',
+    refresh_trigger='manual',
+    distributed_by=['order_date'],
+    buckets=1,
+    properties={'replication_num': '3'},
+    replication_num='1'
+) }}
+
+select order_date, sum(amount) as sales
+from {{ ref('base_orders') }}
+group by order_date
+"""
+
+PARTITIONED_ORDERS_SQL = """
+{{ config(
+    materialized='table',
+    duplicate_key=['order_date', 'order_id'],
+    partition_by=['order_date'],
+    partition_type='RANGE',
+    partition_by_init=[
+        "PARTITION p202607 VALUES LESS THAN ('2026-08-01')",
+        "PARTITION pmax VALUES LESS THAN ('9999-12-31')"
+    ],
+    distributed_by=['order_id'],
+    buckets=1,
+    properties={'replication_num': '1'}
+) }}
+
+select cast('2026-07-01' as date) as order_date, 1 as order_id, 100 as amount
+union all
+select cast('2026-07-02' as date) as order_date, 2 as order_id, 50 as amount
+"""
+
+MV_SINGLE_PARTITION_LIST_SQL = """
+{{ config(
+    materialized='materialized_view',
+    build_mode='deferred',
+    refresh_method='complete',
+    refresh_trigger='manual',
+    partition_by=['order_date'],
+    distributed_by=['order_date'],
+    buckets=1,
+    properties={'replication_num': '1'}
+) }}
+
+select order_date, sum(amount) as sales
+from {{ ref('partitioned_orders') }}
+group by order_date
+"""
+
 
 def with_change_policy(sql, policy):
     return sql.replace(
@@ -535,6 +589,52 @@ class TestDorisMaterializedViewSchedule:
 
         assert "REFRESH AUTO ON SCHEDULE EVERY 1 DAY" in create_sql
         assert 'STARTS "2099-08-01 02:00:00"' in create_sql
+
+
+class TestDorisMvConfig:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "base_orders.sql": BASE_ORDERS_SQL,
+            "mv_replication.sql": MV_TOP_LEVEL_REPLICATION_SQL,
+            "partitioned_orders.sql": PARTITIONED_ORDERS_SQL,
+            "mv_partition.sql": MV_SINGLE_PARTITION_LIST_SQL,
+        }
+
+    def test_top_level_replication_num_is_present_in_doris_ddl(self, project):
+        result = run_dbt(["run", "--select", "+mv_replication"])
+        assert len(result) == 2
+
+        relation = relation_from_name(project.adapter, "mv_replication")
+        create_sql = project.run_sql(
+            f"show create materialized view {relation}",
+            fetch="one",
+        )[1]
+
+        assert re.search(
+            (
+                r"""["']replication_allocation["']\s*=\s*"""
+                r"""["']tag\.location\.default:\s*1["']"""
+            ),
+            create_sql,
+            re.IGNORECASE,
+        )
+
+    def test_single_partition_list_is_present_in_doris_ddl(self, project):
+        result = run_dbt(["run", "--select", "+mv_partition"])
+        assert len(result) == 2
+
+        relation = relation_from_name(project.adapter, "mv_partition")
+        create_sql = project.run_sql(
+            f"show create materialized view {relation}",
+            fetch="one",
+        )[1]
+
+        assert re.search(
+            r"partition\s+by\s*\(\s*`?order_date`?\s*\)",
+            create_sql,
+            re.IGNORECASE,
+        )
 
 
 class TestDorisMaterializedViewTypeSwitch:

@@ -68,7 +68,7 @@ To manage a Doris asynchronous materialized view, configure a model with
     refresh_method='auto',
     refresh_trigger='manual',
     wait_for_refresh=true,
-    properties={'replication_num': '1'}
+    replication_num='1'
 ) }}
 
 select order_date, sum(amount) as sales

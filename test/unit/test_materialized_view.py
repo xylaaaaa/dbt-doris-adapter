@@ -918,6 +918,158 @@ def test_create_scheduled_materialized_view_renders_doris_options_in_order():
     assert positions == sorted(positions), sql
 
 
+def test_top_level_replication_num_is_rendered_as_a_materialized_view_property():
+    runner = materialized_view_runner(config={"replication_num": "1"})
+
+    sql = runner.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+
+    assert 'properties ("replication_num" = "1")' in sql
+
+
+def test_top_level_replication_num_overrides_and_merges_with_properties():
+    runner = materialized_view_runner(
+        config={
+            "replication_num": "1",
+            "properties": {
+                "replication_num": "3",
+                "workload_group": "dbt_mv",
+            },
+        }
+    )
+
+    sql = runner.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+
+    assert (
+        'properties ("replication_num" = "1", "workload_group" = "dbt_mv")'
+        in sql
+    )
+    assert sql.count('"replication_num"') == 1
+
+
+def test_top_level_replication_num_changes_the_materialized_view_definition_hash():
+    replication_one = materialized_view_runner(
+        config={
+            "replication_num": "1",
+            "properties": {"workload_group": "dbt_mv"},
+        }
+    ).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+    replication_two = materialized_view_runner(
+        config={
+            "replication_num": "2",
+            "properties": {"workload_group": "dbt_mv"},
+        }
+    ).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+
+    assert replication_one != replication_two
+
+
+def test_single_partition_list_matches_string_in_sql_and_definition_hash():
+    string_runner = materialized_view_runner(config={"partition_by": "order_date"})
+    list_runner = materialized_view_runner(config={"partition_by": ["order_date"]})
+    relation = FakeRelation(relation_type="materialized_view")
+
+    string_hash = string_runner.render(
+        "doris__materialized_view_definition_hash",
+        "select order_date from orders",
+    )
+    list_hash = list_runner.render(
+        "doris__materialized_view_definition_hash",
+        "select order_date from orders",
+    )
+    string_sql = string_runner.sql(
+        "doris__get_create_materialized_view_as_sql",
+        relation,
+        "select order_date from orders",
+    )
+    list_sql = list_runner.sql(
+        "doris__get_create_materialized_view_as_sql",
+        relation,
+        "select order_date from orders",
+    )
+
+    assert list_hash == string_hash
+    assert list_sql == string_sql
+    assert "partition by (order_date)" in list_sql
+
+
+@pytest.mark.parametrize(
+    "partition_by",
+    [[], [""], [1], ["order_date", "region"]],
+)
+def test_partition_list_requires_exactly_one_non_empty_string(partition_by):
+    runner = materialized_view_runner(config={"partition_by": partition_by})
+
+    with pytest.raises(
+        CapturedCompilerError,
+        match="partition_by.*exactly one.*non-empty string",
+    ):
+        runner.sql(
+            "doris__get_create_materialized_view_as_sql",
+            FakeRelation(relation_type="materialized_view"),
+            "select order_date, region from orders",
+        )
+
+
+@pytest.mark.parametrize(
+    "partition_by",
+    [
+        "`order-date`",
+        "分区列",
+        "date_trunc(order_date, 'day')",
+        "analytics.date_trunc(order_date, 'day')",
+        "analytics . date_trunc(order_date, 'day')",
+        "`analytics` . `date_trunc`(order_date, 'day')",
+    ],
+)
+def test_partition_by_accepts_identifier_and_function_call_shapes(partition_by):
+    sql = materialized_view_runner(config={"partition_by": partition_by}).sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select order_date from orders",
+    )
+
+    assert f"partition by ({partition_by})" in sql
+
+
+@pytest.mark.parametrize(
+    "partition_by",
+    [
+        "order_date, region",
+        "date_trunc(order_date, 'day'), region",
+        "(order_date, region)",
+        "order_date + 1",
+        "123",
+        "date_trunc(order_date, 'day'",
+        "`unterminated",
+    ],
+)
+def test_partition_by_rejects_non_identifier_or_function_call(partition_by):
+    runner = materialized_view_runner(config={"partition_by": partition_by})
+    with pytest.raises(
+        CapturedCompilerError,
+        match="partition_by.*identifier.*function call",
+    ):
+        runner.sql(
+            "doris__get_create_materialized_view_as_sql",
+            FakeRelation(relation_type="materialized_view"),
+            "select order_date, region from orders",
+        )
+
+
 def test_create_on_commit_materialized_view_renders_doris_trigger():
     runner = materialized_view_runner(
         config={
@@ -1092,7 +1244,6 @@ def test_invalid_distribution_config_fails_before_sql_execution(config, message)
             },
             "distributed_by.*non-empty string",
         ),
-        ({"partition_by": ["order_date"]}, "partition_by.*string"),
         (
             {"partition_by": "order_date); drop table orders; --"},
             "partition_by.*unsafe",
