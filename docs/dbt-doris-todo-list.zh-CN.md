@@ -134,13 +134,14 @@ View，不作为 Incremental Strategy。
   归一化定义 Hash、`on_configuration_change`、临时 MV 和 Doris 原子
   `REPLACE WITH MATERIALIZED VIEW`；Pre/Post Hook 与未完成部署恢复已覆盖，
   包括 Replace 后 Post-hook 失败时先原子回滚旧 MV 再重试。
-- [x] 明确刷新责任边界：dbt 部署 CREATE/REPLACE/DROP 和刷新策略 DDL；定义
-  未变化时跳过，不主动提交 Refresh。后续刷新执行和分区选择由 Doris 管理。
-- [x] `BUILD IMMEDIATE` 创建新定义时只等待首次任务。入口：
-  `wait_for_refresh`、`refresh_wait_timeout`、`refresh_poll_interval`；
-  Adapter Response 返回 Task ID、Status 和可用的 Last Query ID。
-- [x] Functional Test 覆盖创建、查询、刷新策略、首次构建任务、配置变化和
-  删除。入口：
+- [x] 支持 `ON MANUAL` Refresh 并返回 Doris Task 状态。首次 Create/Replace
+  只按 `BUILD IMMEDIATE` 等首次 Task，不额外 Refresh；定义未变时 Manual
+  提交 `REFRESH MATERIALIZED VIEW ... AUTO/COMPLETE` 并默认等待，关闭等待时
+  只提交；Schedule/Commit 未变时 Skip。`BUILD DEFERRED + MANUAL` 第一次只
+  创建、第二次运行刷新。入口：`wait_for_refresh`、
+  `refresh_wait_timeout`、`refresh_poll_interval`；不提供指定分区刷新。
+- [x] Functional Test 覆盖创建、查询、Manual Refresh、Schedule/Commit Skip、
+  Deferred 第二次运行、Task 等待/只提交、配置变化和删除。入口：
   `test/functional/adapter/test_doris_materialized_view.py` 和
   `test_doris_materialized_view_basic.py`、
   `test_doris_materialized_view_complete.py` 和

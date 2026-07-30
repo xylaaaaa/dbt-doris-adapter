@@ -252,7 +252,28 @@ def test_definition_hash_changes_with_model_sql_or_ddl_config():
         (None, False, False, {}, "create"),
         ("table", False, False, {}, "replace_type"),
         ("view", False, False, {}, "replace_type"),
-        ("materialized_view", True, False, {}, "skip"),
+        ("materialized_view", True, False, {}, "refresh"),
+        (
+            "materialized_view",
+            True,
+            False,
+            {"refresh_trigger": " MANUAL "},
+            "refresh",
+        ),
+        (
+            "materialized_view",
+            True,
+            False,
+            {"refresh_trigger": "schedule"},
+            "skip",
+        ),
+        (
+            "materialized_view",
+            True,
+            False,
+            {"refresh_trigger": "commit"},
+            "skip",
+        ),
         ("materialized_view", False, False, {}, "replace"),
         (
             "materialized_view",
@@ -373,10 +394,47 @@ def test_definition_match_reads_the_hash_from_show_create():
     ) == "pending"
 
 
-def test_core_materialized_view_dispatch_helpers_use_doris_ddl():
-    runner = materialized_view_runner()
+@pytest.mark.parametrize(
+    ("refresh_method", "expected_method"),
+    [
+        ("auto", "auto"),
+        ("complete", "complete"),
+        (" COMPLETE ", "complete"),
+    ],
+)
+def test_manual_refresh_sql_uses_the_configured_refresh_method(
+    refresh_method,
+    expected_method,
+):
+    runner = materialized_view_runner(
+        config={
+            "refresh_method": refresh_method,
+            "refresh_trigger": "manual",
+        }
+    )
     relation = FakeRelation(relation_type="materialized_view")
 
+    assert runner.sql(
+        "doris__get_refresh_materialized_view_sql",
+        relation,
+    ) == (
+        "refresh materialized view "
+        f"`dbt_test`.`my_model` {expected_method}"
+    )
+
+
+def test_core_materialized_view_dispatch_helpers_use_doris_ddl():
+    runner = materialized_view_runner(
+        config={
+            "refresh_method": "complete",
+            "refresh_trigger": "manual",
+        }
+    )
+    relation = FakeRelation(relation_type="materialized_view")
+
+    assert runner.sql("doris__refresh_materialized_view", relation) == (
+        "refresh materialized view `dbt_test`.`my_model` complete"
+    )
     assert runner.sql("doris__drop_materialized_view", relation) == (
         "drop materialized view if exists `dbt_test`.`my_model`"
     )
@@ -581,6 +639,10 @@ def test_materialization_first_immediate_run_builds_before_exposing_the_target()
         "create materialized view `dbt_test`.`my_model__dbt_tmp`"
     )
     assert "build immediate" in runner.statements[0].sql
+    assert not any(
+        statement.sql.startswith("refresh materialized view")
+        for statement in runner.statements
+    )
     assert "deployment-pending=" in runner.statements[0].sql
     assert "definition-hash=" in runner.statements[1].sql
     assert [event[0] for event in adapter.events] == ["rename", "commit"]
@@ -623,8 +685,12 @@ def test_materialization_first_deferred_run_creates_the_target_without_waiting()
     assert "refresh task" not in raw_results[-1]["message"]
 
 
-def test_unchanged_materialized_view_leaves_refresh_management_to_doris():
-    definition_hash = materialized_view_runner().render(
+def test_unchanged_manual_materialized_view_refreshes_and_waits():
+    config = {
+        "refresh_method": "complete",
+        "refresh_trigger": "manual",
+    }
+    definition_hash = materialized_view_runner(config=config).render(
         "doris__materialized_view_definition_hash",
         "",
     )
@@ -635,11 +701,72 @@ def test_unchanged_materialized_view_leaves_refresh_management_to_doris():
             "create materialized view my_model "
             f"comment 'dbt-doris:definition-hash={definition_hash}' as"
         ),
+        config=config,
+        previous_task_ids=["50"],
+        refresh_task_rows=[
+            ("49", "SUCCESS", None, "query-49"),
+        ],
     )
 
     runner.render("materialization_materialized_view_doris")
 
-    assert [statement.name for statement in runner.statements] == ["drop_relation"]
+    assert [statement.name for statement in runner.statements] == [
+        "main",
+        "drop_relation",
+    ]
+    assert runner.statements[0].sql == (
+        "refresh materialized view `dbt_test`.`my_model` complete"
+    )
+    assert adapter.events == [("commit",)]
+    assert adapter.hook_events == [
+        ("pre", False),
+        ("pre", True),
+        ("post", True),
+        ("post", False),
+    ]
+    assert any(
+        "select TaskId from tasks" in query
+        for query in runner.run_queries
+    )
+    assert any("select TaskId, Status" in query for query in runner.run_queries)
+    assert raw_results[0]["code"] == "REFRESH MATERIALIZED VIEW"
+    assert raw_results[0]["response"].task_id == "49"
+    assert raw_results[0]["response"].task_status == "SUCCESS"
+    assert raw_results[0]["response"].query_id == "query-49"
+
+
+@pytest.mark.parametrize("refresh_trigger", ["schedule", "commit"])
+def test_unchanged_database_triggered_materialized_view_is_a_no_op(
+    refresh_trigger,
+):
+    config = {
+        "refresh_method": "auto",
+        "refresh_trigger": refresh_trigger,
+    }
+    if refresh_trigger == "schedule":
+        config["refresh_schedule"] = {
+            "interval": 1,
+            "unit": "day",
+        }
+    definition_hash = materialized_view_runner(config=config).render(
+        "doris__materialized_view_definition_hash",
+        "",
+    )
+    existing = FakeRelation(relation_type="materialized_view")
+    runner, adapter, raw_results = materialization_runner(
+        existing_relation=existing,
+        show_create_sql=(
+            "create materialized view my_model "
+            f"comment 'dbt-doris:definition-hash={definition_hash}' as"
+        ),
+        config=config,
+    )
+
+    runner.render("materialization_materialized_view_doris")
+
+    assert [statement.name for statement in runner.statements] == [
+        "drop_relation",
+    ]
     assert adapter.events == []
     assert adapter.hook_events == [("pre", False), ("post", False)]
     assert not any("tasks('type'='mv')" in query for query in runner.run_queries)
@@ -794,6 +921,42 @@ def test_wait_for_refresh_can_be_explicitly_disabled():
 
     assert [event[0] for event in adapter.events] == ["rename", "commit"]
     assert not any("tasks('type'='mv')" in query for query in runner.run_queries)
+
+
+def test_manual_refresh_can_submit_without_waiting_for_the_task():
+    config = {
+        "refresh_method": "auto",
+        "refresh_trigger": "manual",
+        "wait_for_refresh": False,
+    }
+    definition_hash = materialized_view_runner(config=config).render(
+        "doris__materialized_view_definition_hash",
+        "",
+    )
+    existing = FakeRelation(relation_type="materialized_view")
+    runner, adapter, raw_results = materialization_runner(
+        existing_relation=existing,
+        show_create_sql=(
+            "create materialized view my_model "
+            f"comment 'dbt-doris:definition-hash={definition_hash}' as"
+        ),
+        config=config,
+        refresh_task_rows=[],
+    )
+
+    runner.render("materialization_materialized_view_doris")
+
+    assert [statement.name for statement in runner.statements] == [
+        "main",
+        "drop_relation",
+    ]
+    assert runner.statements[0].sql == (
+        "refresh materialized view `dbt_test`.`my_model` auto"
+    )
+    assert adapter.events == [("commit",)]
+    assert not any("tasks('type'='mv')" in query for query in runner.run_queries)
+    assert raw_results[0]["code"] == "REFRESH MATERIALIZED VIEW"
+    assert raw_results[0]["response"].task_id is None
 
 
 def test_wait_for_refresh_reports_when_the_new_task_never_appears():

@@ -392,6 +392,7 @@ class DorisAdapter(SQLAdapter):
             "create": "CREATE MATERIALIZED VIEW",
             "replace": "REPLACE MATERIALIZED VIEW",
             "replace_type": "CREATE MATERIALIZED VIEW",
+            "refresh": "REFRESH MATERIALIZED VIEW",
             "skip": "skip",
             "continue": "skip",
         }

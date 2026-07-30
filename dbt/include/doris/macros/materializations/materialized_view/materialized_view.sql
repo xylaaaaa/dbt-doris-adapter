@@ -685,7 +685,10 @@
     {%- elif definition_state == 'pending' -%}
         {{ return('replace') }}
     {%- elif definition_state == 'complete' or definition_state is sameas true -%}
-        {{ return('skip') }}
+        {%- set refresh_trigger = (
+            config.get('refresh_trigger', 'manual') or 'manual'
+        ) | trim | lower -%}
+        {{ return('refresh' if refresh_trigger == 'manual' else 'skip') }}
     {%- endif -%}
 
     {%- set on_configuration_change = (
@@ -707,6 +710,18 @@
             ~ on_configuration_change ~ "'. Expected one of: apply, continue, fail."
         ) }}
     {%- endif -%}
+{%- endmacro %}
+
+{% macro doris__get_refresh_materialized_view_sql(relation) -%}
+    {% do doris__validate_materialized_view_refresh_config() %}
+    {%- set refresh_method = (
+        config.get('refresh_method', 'auto') or 'auto'
+    ) | trim | lower -%}
+    refresh materialized view {{ relation }} {{ refresh_method }}
+{%- endmacro %}
+
+{% macro doris__refresh_materialized_view(relation) -%}
+    {{ doris__get_refresh_materialized_view_sql(relation) }}
 {%- endmacro %}
 
 {% macro doris__drop_materialized_view(relation) -%}
@@ -1092,6 +1107,20 @@
                 ) %}
             {%- endif -%}
 
+        {%- elif action == 'refresh' -%}
+            {%- set previous_task_ids = [] -%}
+            {%- if config.get('wait_for_refresh', true) -%}
+                {%- set previous_task_ids =
+                    doris__materialized_view_task_ids(target_relation)
+                -%}
+            {%- endif -%}
+            {% call statement('main') %}
+                {{ doris__get_refresh_materialized_view_sql(target_relation) }}
+            {% endcall %}
+            {% set refresh_task = doris__wait_for_materialized_view_refresh(
+                target_relation,
+                previous_task_ids
+            ) %}
         {%- endif -%}
 
     {%- endif -%}

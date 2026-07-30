@@ -305,17 +305,16 @@ class TestDorisMaterializedViewLifecycle:
         assert "BUILD DEFERRED" in create_sql
         assert "REFRESH COMPLETE ON MANUAL" in create_sql
         assert "dbt-doris:definition-hash=" in create_sql
+        assert materialized_view_task_ids(project, relation) == set()
 
+        previous_task_ids = materialized_view_task_ids(project, relation)
         second_run = run_dbt(["run", "--select", "daily_sales"])
         assert len(second_run) == 1
         assert mv_info(project, relation)[0] == first_info[0]
-
-        previous_task_ids = materialized_view_task_ids(
-            project,
-            relation,
-        )
-        project.run_sql(f"refresh materialized view {relation} complete")
-        wait_for_new_refresh(project, relation, previous_task_ids)
+        second_response = second_run[0].adapter_response
+        assert second_response["code"] == "REFRESH MATERIALIZED VIEW"
+        assert second_response["task_status"] == "SUCCESS"
+        assert second_response["task_id"] not in previous_task_ids
         rows = project.run_sql(
             f"select order_date, sales from {relation} order by order_date",
             fetch="all",
@@ -325,18 +324,22 @@ class TestDorisMaterializedViewLifecycle:
             (rows[1][0], 50),
         ]
 
-        doris_task_ids = materialized_view_task_ids(project, relation)
+        previous_task_ids = materialized_view_task_ids(project, relation)
         project.run_sql(
             "insert into base_orders values "
             "(4, cast('2026-07-03' as date), 75)"
         )
-        unchanged_run = run_dbt(["run", "--select", "daily_sales"])
-        assert len(unchanged_run) == 1
-        assert materialized_view_task_ids(project, relation) == doris_task_ids
-        assert project.run_sql(
+        third_run = run_dbt(["run", "--select", "daily_sales"])
+        assert len(third_run) == 1
+        third_response = third_run[0].adapter_response
+        assert third_response["code"] == "REFRESH MATERIALIZED VIEW"
+        assert third_response["task_status"] == "SUCCESS"
+        assert third_response["task_id"] not in previous_task_ids
+        refreshed_rows = project.run_sql(
             f"select order_date, sales from {relation} order by order_date",
             fetch="all",
-        ) == rows
+        )
+        assert [row[1] for row in refreshed_rows] == [300, 50, 75]
 
 
 class TestDorisMaterializedViewChanges:
@@ -446,6 +449,16 @@ class TestDorisMaterializedViewOnCommit:
             project,
             relation,
         )
+        unchanged_run = run_dbt(
+            ["run", "--select", "daily_sales_commit"]
+        )
+        assert len(unchanged_run) == 1
+        assert unchanged_run[0].adapter_response["code"] == "skip"
+        assert materialized_view_task_ids(
+            project,
+            relation,
+        ) == previous_task_ids
+
         project.run_sql(
             "insert into base_orders values "
             "(4, cast('2026-07-03' as date), 75)"
@@ -635,6 +648,17 @@ class TestDorisMaterializedViewSchedule:
 
         assert "REFRESH AUTO ON SCHEDULE EVERY 1 DAY" in create_sql
         assert 'STARTS "2099-08-01 02:00:00"' in create_sql
+
+        previous_task_ids = materialized_view_task_ids(project, relation)
+        unchanged_run = run_dbt(
+            ["run", "--select", "daily_sales_scheduled"]
+        )
+        assert len(unchanged_run) == 1
+        assert unchanged_run[0].adapter_response["code"] == "skip"
+        assert materialized_view_task_ids(
+            project,
+            relation,
+        ) == previous_task_ids
 
 
 class TestDorisMvConfig:
