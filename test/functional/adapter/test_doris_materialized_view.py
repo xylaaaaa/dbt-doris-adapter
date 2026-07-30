@@ -108,6 +108,14 @@ DAILY_SALES_FAILING_POST_HOOK_SQL = DAILY_SALES_MV_SQL.replace(
     "    post_hook='select * from __dbt_missing_post_hook_table__'",
 )
 
+DAILY_SALES_CHANGED_FAILING_POST_HOOK_SQL = (
+    DAILY_SALES_MV_CHANGED_SQL.replace(
+        "properties={'replication_num': '1'}",
+        "properties={'replication_num': '1'},\n"
+        "    post_hook='select * from __dbt_missing_post_hook_table__'",
+    )
+)
+
 MV_TOP_LEVEL_REPLICATION_SQL = """
 {{ config(
     materialized='materialized_view',
@@ -569,6 +577,74 @@ class TestDorisMaterializedViewPendingRecovery:
         )[1]
         assert "dbt-doris:definition-hash=" in completed_create_sql
         assert "dbt-doris:deployment-pending=" not in completed_create_sql
+
+
+class TestDorisMaterializedViewReplaceRollback:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "base_orders.sql": BASE_ORDERS_SQL,
+            "daily_sales.sql": DAILY_SALES_MV_SQL,
+        }
+
+    def test_failed_post_hook_preserves_and_restores_previous_mv(self, project):
+        run_dbt(["run"])
+        relation = relation_from_name(project.adapter, "daily_sales")
+        original_info = mv_info(project, relation)
+
+        set_model_file(
+            project,
+            relation,
+            DAILY_SALES_CHANGED_FAILING_POST_HOOK_SQL,
+        )
+        failed_replace = run_dbt(
+            ["run", "--select", "daily_sales"],
+            expect_pass=False,
+        )
+        assert len(failed_replace) == 1
+
+        pending_ddl = project.run_sql(
+            f"show create materialized view {relation}",
+            fetch="one",
+        )[1]
+        assert "dbt-doris:deployment-pending=" in pending_ddl
+        preserved_old_mv = project.run_sql(
+            "select Id, QuerySql from mv_infos("
+            f'"database"="{relation.schema}") '
+            "where Name = 'daily_sales__dbt_tmp'",
+            fetch="one",
+        )
+        assert preserved_old_mv[0] == original_info[0]
+        assert preserved_old_mv[1] == original_info[4]
+
+        set_model_file(project, relation, DAILY_SALES_ASYNC_FAILURE_SQL)
+        failed_retry = run_dbt(
+            ["run", "--select", "daily_sales"],
+            expect_pass=False,
+        )
+        assert len(failed_retry) == 1
+
+        restored_info = mv_info(project, relation)
+        assert restored_info[0] == original_info[0]
+        assert restored_info[4] == original_info[4]
+        restored_ddl = project.run_sql(
+            f"show create materialized view {relation}",
+            fetch="one",
+        )[1]
+        assert "dbt-doris:definition-hash=" in restored_ddl
+        assert "dbt-doris:deployment-pending=" not in restored_ddl
+
+        set_model_file(project, relation, DAILY_SALES_MV_CHANGED_SQL)
+        completed_retry = run_dbt(["run", "--select", "daily_sales"])
+        assert len(completed_retry) == 1
+        assert mv_info(project, relation)[0] != original_info[0]
+        temporary_relations = project.run_sql(
+            "select Name from mv_infos("
+            f'"database"="{relation.schema}") '
+            "where Name like 'daily_sales__dbt_tmp%'",
+            fetch="all",
+        )
+        assert temporary_relations == []
 
 
 class TestDorisMaterializedViewSchedule:

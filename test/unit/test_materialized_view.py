@@ -23,10 +23,15 @@
 import hashlib
 from types import SimpleNamespace
 
+import agate
+import dbt.exceptions
 import pytest
 
 from dbt.adapters.contracts.relation import RelationType
-from dbt.adapters.doris.impl import DorisAdapter
+from dbt.adapters.doris.impl import (
+    DorisAdapter,
+    _validate_doris_materialized_view_version,
+)
 from dbt.adapters.doris.relation import DorisRelation
 
 from .macro_harness import CapturedCompilerError, FakeConfig, FakeRelation, MacroRunner
@@ -55,6 +60,7 @@ def materialization_runner(
     previous_task_ids=None,
     refresh_task_rows=None,
     fail_inside_post_hook=False,
+    fail_grant_preflight=False,
 ):
     raw_results = []
     run_queries = []
@@ -68,6 +74,7 @@ def materialization_runner(
         def __init__(self):
             self.events = []
             self.hook_events = []
+            self.timeline = []
 
         def drop_relation(self, relation):
             self.events.append(("drop", relation))
@@ -77,6 +84,23 @@ def materialization_runner(
 
         def commit(self):
             self.events.append(("commit",))
+
+        def materialized_view_adapter_response(
+            self,
+            action,
+            relation,
+            refresh_task=None,
+        ):
+            return DorisAdapter.materialized_view_adapter_response(
+                self,
+                action,
+                relation,
+                refresh_task,
+            )
+
+        def validate_materialized_view_version(self, frontends_table):
+            assert frontends_table.rows[0]["Version"].startswith("doris-")
+            self.timeline.append(("version", frontends_table.rows[0]["Version"]))
 
     adapter = Adapter()
     target = FakeRelation(relation_type=None)
@@ -91,6 +115,11 @@ def materialization_runner(
     def run_query(sql):
         run_queries.append(sql)
         normalized_sql = " ".join(sql.lower().split())
+        adapter.timeline.append(("query", normalized_sql))
+        if normalized_sql == "show frontends":
+            return SimpleNamespace(
+                rows=[{"Version": "doris-4.1.2-test"}],
+            )
         if normalized_sql.startswith("show create materialized view"):
             return SimpleNamespace(rows=[["my_model", show_create_sql]])
         if normalized_sql.startswith("select taskid from tasks"):
@@ -116,8 +145,15 @@ def materialization_runner(
 
     def run_hooks(hooks, inside_transaction):
         adapter.hook_events.append((hooks[0], inside_transaction))
+        adapter.timeline.append(("hook", hooks[0], inside_transaction))
         if fail_inside_post_hook and hooks[0] == "post" and inside_transaction:
             raise CapturedCompilerError("inside post-hook failed")
+        return ""
+
+    def preflight_grants(relation, grant_config):
+        adapter.timeline.append(("grants_preflight", grant_config))
+        if fail_grant_preflight:
+            raise CapturedCompilerError("grant principal does not exist")
         return ""
 
     runner = MacroRunner(
@@ -127,6 +163,7 @@ def materialization_runner(
             "adapter": adapter,
             "apply_grants": lambda *args, **kwargs: "",
             "config": FakeConfig(config),
+            "doris__preflight_grants": preflight_grants,
             "execute": True,
             "load_cached_relation": load_cached_relation,
             "local_md5": lambda value: hashlib.md5(value.encode()).hexdigest(),
@@ -140,6 +177,15 @@ def materialization_runner(
             "run_query": run_query,
             "should_full_refresh": lambda: full_refresh,
             "should_revoke": lambda *args, **kwargs: False,
+            "store_result": lambda name, response, agate_table=None: raw_results.append(
+                {
+                    "name": name,
+                    "response": response,
+                    "message": str(response),
+                    "code": response.code,
+                    "rows_affected": response.rows_affected,
+                }
+            ),
             "store_raw_result": lambda **kwargs: raw_results.append(kwargs),
             "this": target,
         },
@@ -345,6 +391,38 @@ def test_refresh_sql_uses_the_configured_doris_refresh_method():
     assert sql == "refresh materialized view `dbt_test`.`my_model` complete"
 
 
+@pytest.mark.parametrize(
+    ("partitions", "expected"),
+    [
+        ("p202607", "partition (`p202607`)"),
+        (
+            ["p202607", "p202608"],
+            "partitions (`p202607`, `p202608`)",
+        ),
+    ],
+)
+def test_refresh_sql_supports_one_or_more_doris_mv_partitions(
+    partitions,
+    expected,
+):
+    runner = materialized_view_runner(
+        config={
+            "refresh_method": "complete",
+            "refresh_partitions": partitions,
+            "partition_by": "order_date",
+            "refresh_on_run": True,
+        }
+    )
+
+    sql = runner.sql(
+        "doris__get_refresh_materialized_view_sql",
+        FakeRelation(relation_type="materialized_view"),
+    )
+
+    assert sql == f"refresh materialized view `dbt_test`.`my_model` {expected}"
+    assert not sql.endswith(" complete")
+
+
 def test_core_materialized_view_dispatch_helpers_use_doris_sql():
     runner = materialized_view_runner(config={"refresh_method": "complete"})
     relation = FakeRelation(relation_type="materialized_view")
@@ -385,7 +463,10 @@ def test_replace_sql_uses_doris_atomic_materialized_view_swap():
 
 
 def test_deployment_complete_sql_replaces_the_pending_hash_marker():
-    runner = materialized_view_runner(model={"description": "Daily sales"})
+    runner = materialized_view_runner(
+        config={"persist_docs": {"relation": True}},
+        model={"description": "Daily sales"},
+    )
 
     sql = runner.sql(
         "doris__get_mark_materialized_view_deployment_complete_sql",
@@ -398,6 +479,144 @@ def test_deployment_complete_sql_replaces_the_pending_hash_marker():
         "'Daily sales dbt-doris:definition-hash="
     )
     assert "deployment-pending" not in sql
+
+
+def test_relation_description_is_persisted_only_when_relation_docs_are_enabled():
+    model = {"description": "Daily sales"}
+    disabled = materialized_view_runner(model=model)
+    enabled = materialized_view_runner(
+        config={"persist_docs": {"relation": True}},
+        model=model,
+    )
+
+    disabled_sql = disabled.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+    enabled_sql = enabled.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+
+    assert "Daily sales" not in disabled_sql
+    assert "Daily sales dbt-doris:deployment-pending=" in enabled_sql
+    assert disabled.render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    ) != enabled.render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+
+
+def test_column_descriptions_are_rendered_in_create_materialized_view():
+    schema_probes = []
+    runner = materialized_view_runner(
+        config={"persist_docs": {"columns": True}},
+        model={
+            "name": "daily_sales",
+            "columns": {
+                "order_date": {"description": "Business date"},
+                "sales": {"description": "It's total"},
+            },
+        },
+    )
+    runner.context.update(
+        {
+            "execute": True,
+            "adapter": SimpleNamespace(
+                get_column_schema_from_query=lambda sql: (
+                    schema_probes.append(sql)
+                    or [
+                        SimpleNamespace(name="order_date"),
+                        SimpleNamespace(name="sales"),
+                        SimpleNamespace(name="undocumented"),
+                    ]
+                )
+            ),
+        }
+    )
+
+    sql = runner.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select order_date, sales, 1 as undocumented from orders",
+    )
+
+    assert (
+        "(`order_date` comment 'Business date', "
+        "`sales` comment 'It\\'s total', `undocumented`)"
+    ) in sql
+    assert len(schema_probes) == 1
+    normalized_probe = " ".join(schema_probes[0].lower().split())
+    assert normalized_probe.startswith("select * from ( select order_date")
+    assert "where false limit 0" in normalized_probe
+
+
+def test_column_description_changes_the_hash_only_when_column_docs_are_enabled():
+    first_model = {"columns": {"id": {"description": "First"}}}
+    second_model = {"columns": {"id": {"description": "Second"}}}
+
+    disabled_first = materialized_view_runner(model=first_model).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+    disabled_second = materialized_view_runner(model=second_model).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+    enabled_first = materialized_view_runner(
+        config={"persist_docs": {"columns": True}},
+        model=first_model,
+    ).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+    enabled_second = materialized_view_runner(
+        config={"persist_docs": {"columns": True}},
+        model=second_model,
+    ).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+
+    assert disabled_first == disabled_second
+    assert enabled_first != enabled_second
+
+
+def test_column_doc_quote_semantics_are_part_of_the_definition_hash():
+    unquoted = materialized_view_runner(
+        config={"persist_docs": {"columns": True}},
+        model={
+            "columns": {
+                "SALES": {
+                    "description": "Gross sales",
+                    "quote": False,
+                }
+            }
+        },
+    ).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as sales",
+    )
+    quoted = materialized_view_runner(
+        config={"persist_docs": {"columns": True}},
+        model={
+            "columns": {
+                "SALES": {
+                    "description": "Gross sales",
+                    "quote": True,
+                }
+            }
+        },
+    ).render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as sales",
+    )
+
+    assert unquoted != quoted
 
 
 def test_materialization_first_immediate_run_builds_before_exposing_the_target():
@@ -425,6 +644,8 @@ def test_materialization_first_immediate_run_builds_before_exposing_the_target()
         ("post", False),
     ]
     assert raw_results[0]["code"] == "CREATE MATERIALIZED VIEW"
+    assert raw_results[0]["response"].task_id == "1"
+    assert raw_results[0]["response"].task_status == "SUCCESS"
     assert any(
         "select TaskId from tasks" in query
         for query in runner.run_queries
@@ -451,7 +672,8 @@ def test_materialization_first_deferred_run_creates_the_target_without_waiting()
     assert "definition-hash=" in runner.statements[1].sql
     assert not any("tasks('type'='mv')" in query for query in runner.run_queries)
     assert adapter.events == [("commit",)]
-    assert raw_results == []
+    assert raw_results[-1]["code"] == "CREATE MATERIALIZED VIEW"
+    assert "refresh task" not in raw_results[-1]["message"]
 
 
 def test_materialization_same_definition_is_a_true_no_op():
@@ -474,6 +696,61 @@ def test_materialization_same_definition_is_a_true_no_op():
     assert adapter.events == []
     assert adapter.hook_events == [("pre", False), ("post", False)]
     assert raw_results[0]["code"] == "skip"
+
+
+def test_outside_pre_hook_runs_before_show_create_definition_inspection():
+    existing = FakeRelation(relation_type="materialized_view")
+    runner, adapter, _ = materialization_runner(
+        existing_relation=existing,
+        show_create_sql=(
+            "create materialized view my_model "
+            "comment 'dbt-doris:definition-hash=stale' as select 0"
+        ),
+        config={"build_mode": "deferred"},
+    )
+
+    runner.render("materialization_materialized_view_doris")
+
+    outside_pre_hook = adapter.timeline.index(("hook", "pre", False))
+    show_create = next(
+        index
+        for index, event in enumerate(adapter.timeline)
+        if event[0] == "query"
+        and event[1].startswith("show create materialized view")
+    )
+    assert outside_pre_hook < show_create
+
+
+def test_invalid_grants_fail_before_definition_inspection_or_target_ddl():
+    existing = FakeRelation(relation_type="materialized_view")
+    runner, adapter, _ = materialization_runner(
+        existing_relation=existing,
+        config={
+            "build_mode": "deferred",
+            "grants": {"select": ["role:missing"]},
+        },
+        fail_grant_preflight=True,
+    )
+
+    with pytest.raises(
+        CapturedCompilerError,
+        match="grant principal does not exist",
+    ):
+        runner.render("materialization_materialized_view_doris")
+
+    assert ("hook", "pre", False) in adapter.timeline
+    assert ("version", "doris-4.1.2-test") in adapter.timeline
+    assert (
+        "grants_preflight",
+        {"select": ["role:missing"]},
+    ) in adapter.timeline
+    assert not any(
+        event[0] == "query"
+        and event[1].startswith("show create materialized view")
+        for event in adapter.timeline
+    )
+    assert runner.statements == []
+    assert adapter.events == []
 
 
 def test_materialization_definition_change_builds_then_atomically_swaps():
@@ -500,7 +777,8 @@ def test_materialization_definition_change_builds_then_atomically_swaps():
     )
     assert 'properties("swap" = "true")' in runner.statements[1].sql
     assert adapter.events == [("commit",)]
-    assert raw_results == []
+    assert raw_results[-1]["code"] == "REPLACE MATERIALIZED VIEW"
+    assert "refresh task 1 SUCCESS" in raw_results[-1]["message"]
 
 
 def test_materialization_refresh_on_run_recognizes_a_lower_new_task_id():
@@ -551,7 +829,12 @@ def test_materialization_refresh_on_run_recognizes_a_lower_new_task_id():
     assert all(">" not in query for query in refresh_queries)
     assert sum(query.lower().startswith("select sleep(") for query in runner.run_queries) == 2
     assert adapter.events == [("commit",)]
-    assert raw_results == []
+    assert raw_results[-1]["code"] == "REFRESH MATERIALIZED VIEW"
+    assert "refresh task 40 SUCCESS" in raw_results[-1]["message"]
+    assert "query query-40" in raw_results[-1]["message"]
+    assert raw_results[-1]["response"].task_id == "40"
+    assert raw_results[-1]["response"].task_status == "SUCCESS"
+    assert raw_results[-1]["response"].query_id == "query-40"
 
 
 def test_materialization_does_not_swap_when_immediate_build_fails():
@@ -622,6 +905,44 @@ def test_materialization_removes_a_stale_intermediate_before_recovery():
     runner.render("materialization_materialized_view_doris")
 
     assert adapter.events[0] == ("drop", stale_intermediate)
+    assert adapter.events[-1] == ("commit",)
+
+
+def test_pending_replace_rolls_back_preserved_old_mv_before_retrying():
+    existing = FakeRelation(relation_type="materialized_view")
+    preserved_old_mv = FakeRelation(
+        identifier="my_model__dbt_tmp",
+        relation_type="materialized_view",
+    )
+    runner, adapter, _ = materialization_runner(
+        existing_relation=existing,
+        preexisting_intermediate_relation=preserved_old_mv,
+        show_create_sql=(
+            "create materialized view my_model "
+            "comment 'dbt-doris:deployment-pending=old' as select 0"
+        ),
+        config={
+            "build_mode": "deferred",
+            "on_configuration_change": "continue",
+        },
+    )
+
+    runner.render("materialization_materialized_view_doris")
+
+    assert [statement.name for statement in runner.statements] == [
+        "rollback_materialized_view",
+        "create_materialized_view_intermediate",
+        "main",
+        "mark_materialized_view_deployment_complete",
+        "drop_relation",
+    ]
+    assert "alter materialized view `dbt_test`.`my_model`" in (
+        runner.statements[0].sql.lower()
+    )
+    assert "replace with materialized view `my_model__dbt_tmp`" in (
+        " ".join(runner.statements[0].sql.lower().split())
+    )
+    assert adapter.events[0] == ("drop", preserved_old_mv)
     assert adapter.events[-1] == ("commit",)
 
 
@@ -746,7 +1067,7 @@ def test_materialization_full_refresh_replaces_even_with_continue_policy():
     assert "build deferred" in runner.statements[0].sql.lower()
     assert "replace with materialized view" in runner.statements[1].sql.lower()
     assert adapter.events == [("commit",)]
-    assert raw_results == []
+    assert raw_results[-1]["code"] == "REPLACE MATERIALIZED VIEW"
 
 
 @pytest.mark.parametrize("existing_type", ["table", "view"])
@@ -893,6 +1214,7 @@ def test_create_scheduled_materialized_view_renders_doris_options_in_order():
                 "replication_num": "1",
                 "workload_group": "dbt_mv",
             },
+            "persist_docs": {"relation": True},
         },
         model={"description": "Daily customer sales"},
     )
@@ -975,6 +1297,66 @@ def test_top_level_replication_num_changes_the_materialized_view_definition_hash
     )
 
     assert replication_one != replication_two
+
+
+def test_replication_num_integer_and_trimmed_string_are_canonical():
+    integer_runner = materialized_view_runner(config={"replication_num": 1})
+    string_runner = materialized_view_runner(config={"replication_num": " 1 "})
+
+    integer_sql = integer_runner.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+    string_sql = string_runner.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+
+    assert integer_sql == string_sql
+    assert '"replication_num" = "1"' in integer_sql
+
+
+def test_equivalent_identifier_and_bucket_configs_have_one_definition_hash():
+    scalar = materialized_view_runner(
+        config={
+            "duplicate_key": " id ",
+            "distribution_type": "HASH",
+            "distributed_by": " id ",
+            "buckets": "AUTO",
+        }
+    )
+    list_form = materialized_view_runner(
+        config={
+            "duplicate_key": ["id"],
+            "distribution_type": "hash",
+            "distributed_by": ["id"],
+            "buckets": "auto",
+        }
+    )
+
+    scalar_hash = scalar.render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+    list_hash = list_form.render(
+        "doris__materialized_view_definition_hash",
+        "select 1 as id",
+    )
+    scalar_sql = scalar.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+    list_sql = list_form.sql(
+        "doris__get_create_materialized_view_as_sql",
+        FakeRelation(relation_type="materialized_view"),
+        "select 1 as id",
+    )
+
+    assert scalar_hash == list_hash
+    assert scalar_sql == list_sql
 
 
 def test_single_partition_list_matches_string_in_sql_and_definition_hash():
@@ -1087,7 +1469,7 @@ def test_create_on_commit_materialized_view_renders_doris_trigger():
     assert "build deferred refresh auto on commit" in sql
 
 
-def test_create_schedule_supports_seconds():
+def test_create_schedule_rejects_test_only_seconds():
     runner = materialized_view_runner(
         config={
             "build_mode": "deferred",
@@ -1096,13 +1478,15 @@ def test_create_schedule_supports_seconds():
         }
     )
 
-    sql = runner.sql(
-        "doris__get_create_materialized_view_as_sql",
-        FakeRelation(relation_type="materialized_view"),
-        "select 1 as id",
-    )
-
-    assert "refresh auto on schedule every 30 second" in sql
+    with pytest.raises(
+        CapturedCompilerError,
+        match="refresh_schedule.unit.*test-only",
+    ):
+        runner.sql(
+            "doris__get_create_materialized_view_as_sql",
+            FakeRelation(relation_type="materialized_view"),
+            "select 1 as id",
+        )
 
 
 def test_create_sql_escapes_comments_properties_and_identifiers():
@@ -1110,6 +1494,7 @@ def test_create_sql_escapes_comments_properties_and_identifiers():
         config={
             "duplicate_key": ["odd`key"],
             "properties": {'quoted"key': 'c:\\path\\"value'},
+            "persist_docs": {"relation": True},
         },
         model={"description": "it's c:\\data"},
     )
@@ -1166,7 +1551,7 @@ def test_invalid_build_mode_fails_before_sql_execution():
                 "refresh_trigger": "schedule",
                 "refresh_schedule": {"interval": 1, "unit": "month"},
             },
-            "refresh_schedule.unit.*second.*minute.*hour.*day.*week",
+            "refresh_schedule.unit.*minute.*hour.*day.*week",
         ),
         (
             {
@@ -1185,6 +1570,25 @@ def test_invalid_build_mode_fails_before_sql_execution():
                 "refresh_schedule": {"interval": 1, "unit": "day"},
             },
             "refresh_schedule.*only valid.*schedule",
+        ),
+        ({"refresh_partitions": []}, "refresh_partitions.*must not be empty"),
+        (
+            {"refresh_partitions": ["p202607", 1]},
+            "refresh_partitions.*non-empty string",
+        ),
+        (
+            {
+                "refresh_partitions": ["p202607"],
+                "refresh_on_run": True,
+            },
+            "refresh_partitions.*requires partition_by",
+        ),
+        (
+            {
+                "refresh_partitions": ["p202607"],
+                "partition_by": "order_date",
+            },
+            "refresh_partitions.*requires refresh_on_run=true",
         ),
     ],
 )
@@ -1249,6 +1653,13 @@ def test_invalid_distribution_config_fails_before_sql_execution(config, message)
             "partition_by.*unsafe",
         ),
         ({"properties": ["replication_num", "1"]}, "properties.*dictionary"),
+        ({"properties": {"": "1"}}, "property name.*non-empty string"),
+        (
+            {"properties": {"replication_num": {"count": 1}}},
+            "property.*replication_num.*string, number, or boolean",
+        ),
+        ({"replication_num": 0}, "replication_num.*positive integer"),
+        ({"replication_num": "many"}, "replication_num.*positive integer"),
         ({"refresh_on_run": "yes"}, "refresh_on_run.*true.*false"),
         ({"wait_for_refresh": "yes"}, "wait_for_refresh.*true.*false"),
         ({"refresh_wait_timeout": 0}, "refresh_wait_timeout.*positive integer"),
@@ -1372,6 +1783,72 @@ def test_adapter_maps_async_materialized_views_to_the_dbt_relation_type():
         RelationType.MaterializedView,
         RelationType.View,
     ]
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "doris-2.1.5-release",
+        "doris-2.1.10-release",
+        "doris-3.0.1-release",
+        "doris-3.1.0-release",
+        "doris-4.1.2-rc01-build",
+    ],
+)
+def test_materialized_view_version_contract_accepts_supported_releases(version):
+    table = agate.Table(
+        [(version, "Yes")],
+        ["Version", "CurrentConnected"],
+    )
+
+    _validate_doris_materialized_view_version(table)
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "doris-2.1.4-release",
+        "doris-3.0.0-release",
+    ],
+)
+def test_materialized_view_version_contract_rejects_missing_atomic_replace(
+    version,
+):
+    table = agate.Table(
+        [(version, "Yes")],
+        ["Version", "CurrentConnected"],
+    )
+
+    with pytest.raises(dbt.exceptions.DbtRuntimeError, match="require.*3.0.1"):
+        _validate_doris_materialized_view_version(table)
+
+
+def test_materialized_view_version_contract_uses_the_connected_frontend():
+    table = agate.Table(
+        [
+            ("doris-3.0.0-release", "No"),
+            ("doris-4.1.2-release", "Yes"),
+        ],
+        ["Version", "CurrentConnected"],
+    )
+
+    _validate_doris_materialized_view_version(table)
+
+
+def test_materialized_view_version_contract_also_validates_master_frontend():
+    table = agate.Table(
+        [
+            ("doris-4.1.2-release", "Yes", "No"),
+            ("doris-3.0.0-release", "No", "Yes"),
+        ],
+        ["Version", "CurrentConnected", "IsMaster"],
+    )
+
+    with pytest.raises(
+        dbt.exceptions.DbtRuntimeError,
+        match="Required FE version: doris-3.0.0",
+    ):
+        _validate_doris_materialized_view_version(table)
 
 
 def test_drop_async_materialized_view_uses_doris_two_word_relation_type():

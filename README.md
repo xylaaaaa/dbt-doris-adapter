@@ -13,6 +13,7 @@ dbt Labs release.
 | --- | --- |
 | dbt Core | 1.12.x |
 | Apache Doris | 2.1.5 or newer |
+| Doris Async MV | 2.1.5+ on 2.1.x; 3.0.1+; 3.1.x; 4.x |
 | Python | 3.10 or newer |
 | Database protocol | Doris MySQL protocol |
 
@@ -86,10 +87,100 @@ Waiting requires Doris materialized-view task history to remain enabled so the
 adapter can identify the task submitted by the current dbt action.
 
 The supported refresh triggers are `manual`, `schedule`, and `commit`.
-Schedules accept `second`, `minute`, `hour`, `day`, or `week`. Set
-`refresh_on_run=true` to refresh an unchanged manual MV on each dbt run.
-Materialized-view `grants` use the same Doris privilege reconciliation as
-tables and views.
+Production schedules accept `minute`, `hour`, `day`, or `week`. The adapter
+rejects `second` because Doris only enables second-level schedules through a
+test-only setting.
+
+Common asynchronous MV settings are:
+
+| Config | Purpose |
+| --- | --- |
+| `build_mode` | `immediate` (default) waits for the initial build; `deferred` creates without an initial refresh. |
+| `refresh_method` | Doris `auto` (default) or `complete` refresh method. |
+| `refresh_trigger` | `manual` (default), `schedule`, or `commit`. |
+| `refresh_schedule` | Schedule mapping with `interval`, `unit`, and optional `start_time`. |
+| `refresh_on_run` | Submit an explicit refresh for an unchanged MV during every dbt run; defaults to `false`. |
+| `refresh_partitions` | One partition name or a list for `refresh_on_run=true`; requires a partitioned MV. |
+| `wait_for_refresh` | Wait for an adapter-submitted refresh to finish; defaults to `true`. |
+| `refresh_wait_timeout` / `refresh_poll_interval` | Refresh-task timeout and polling interval in seconds. |
+| `duplicate_key` | One key column or a list of key columns for `DUPLICATE KEY`. |
+| `partition_by` | One partition identifier or Doris-supported function call, supplied as a string or single-item list. |
+| `distribution_type` | `hash` or `random`; inferred from whether `distributed_by` is set. |
+| `distributed_by` / `buckets` | Doris distribution columns and bucket count. |
+| `replication_num` | Convenience setting merged into `properties`; it takes precedence over the same key in `properties`. |
+| `properties` | Additional Doris MV properties as a dictionary. |
+| `on_configuration_change` | `apply` (atomic replacement), `continue`, or `fail`. |
+
+Unlike dbt Core's default materialized-view workflow, dbt-doris skips refresh
+when an asynchronous MV definition is unchanged. This lets Doris schedule or
+commit triggers own refresh timing. Set `refresh_on_run=true` to opt into a
+refresh on every dbt run. When waiting is enabled, the adapter polls Doris
+`tasks('type'='mv')`; the dbt adapter response includes the successful refresh
+task ID, status, and last query ID when Doris provides one. Failed, canceled,
+unexpected, or timed-out tasks fail the model instead of being reported as a
+successful run.
+
+Outside-transaction pre-hooks run before deployed-definition inspection.
+Definition changes are built as a temporary MV and exposed through Doris's
+atomic materialized-view replacement; with `BUILD IMMEDIATE`, exposure happens
+only after the refresh succeeds, while `BUILD DEFERRED` intentionally has no
+initial refresh to wait for. The deployment marker is finalized after
+inside-transaction post-hooks, allowing a later run to detect and recover an
+interrupted deployment. If an atomic replacement succeeded but an inside
+post-hook failed, the previous MV remains under the temporary name; the next
+run atomically restores it before retrying the deployment.
+
+`persist_docs` is supported for both the MV relation and its columns. The
+relation description is included in the MV comment only when
+`persist_docs.relation` is enabled; the adapter's definition/deployment marker
+remains in that comment independently. Column descriptions are rendered in the
+MV column definitions when `persist_docs.columns` is enabled.
+
+Doris relation grants require explicit principals:
+
+```yaml
+models:
+  your_project:
+    +grants:
+      select:
+        - "role:analyst"
+        - "user:reporter@%"
+    +grants_mode: replace
+```
+
+Before any materialized-view DDL, the adapter validates every configured
+principal so an invalid User or Role cannot expose a new MV definition or leave
+partial grants. `grants_mode: replace` converges direct relation grants by
+revoking stale entries; `additive` only adds configured privileges. User
+identities must use
+`user:<name>@<host>` (or `user:<name>@[<domain>]`) and roles must use
+`role:<name>`, so the adapter never guesses whether a bare name is a User or a
+Role. Managing grants requires an execution identity that can read `SHOW ROLES`
+and administer privileges on the target relation.
+
+Asynchronous-MV compatibility is:
+
+| Doris release line | Supported versions |
+| --- | --- |
+| 2.1 | 2.1.5 and newer 2.1.x releases, including `ON COMMIT` |
+| 3.0 | 3.0.1 and newer; 3.0.0 is excluded |
+| 3.1 | 3.1.x |
+| 4.x | 4.x |
+
+Before managing an asynchronous MV, the adapter reads the connected and Master
+FE versions from `SHOW FRONTENDS` and rejects an unknown, unparsable, or
+unsupported required FE. Doris 3.0.0 is excluded because it does not provide
+the atomic materialized-view replacement semantics used by this lifecycle.
+
+Only Doris asynchronous materialized views are managed. Synchronous
+materialized views (rollups) have a different lifecycle and remain explicitly
+out of scope.
+
+The complete configuration and lifecycle guide is available in
+[docs/materialized-view.zh-CN.md](docs/materialized-view.zh-CN.md). The
+[implementation TODO](docs/dbt-doris-todo-list.zh-CN.md) and
+[#65967 acceptance requirements](docs/dbt-doris-issue-65967-async-materialized-view-requirements.zh-CN.md)
+record the delivered scope and remaining adapter work.
 
 ## Test
 
