@@ -21,14 +21,12 @@
 """Completion coverage for Doris asynchronous materialized views."""
 
 import json
-import re
 
 import pytest
 from dbt.tests.util import (
     read_file,
     relation_from_name,
     run_dbt,
-    set_model_file,
     write_file,
 )
 
@@ -97,47 +95,6 @@ DOCS_SCHEMA_CHANGED_YML = DOCS_SCHEMA_YML.replace(
     'description: "Gross sales"',
     'description: "Gross sales after returns"',
 )
-
-PARTITION_BASE_SQL = """
-{{ config(
-    materialized='table',
-    duplicate_key=['order_date', 'order_id'],
-    partition_by=['order_date'],
-    partition_type='RANGE',
-    partition_by_init=[
-        "PARTITION p202607 VALUES LESS THAN ('2026-08-01')",
-        "PARTITION p202608 VALUES LESS THAN ('2026-09-01')",
-        "PARTITION pmax VALUES LESS THAN ('9999-12-31')"
-    ],
-    distributed_by=['order_id'],
-    buckets=1,
-    properties={'replication_num': '1'}
-) }}
-
-select cast('2026-07-01' as date) as order_date, 1 as order_id, 100 as amount
-union all
-select cast('2026-08-01' as date) as order_date, 2 as order_id, 200 as amount
-"""
-
-PARTITION_MV_SQL = """
-{{ config(
-    materialized='materialized_view',
-    build_mode='immediate',
-    refresh_method='complete',
-    refresh_trigger='manual',
-    refresh_on_run=true,
-    refresh_partitions=['p202607'],
-    partition_by='order_date',
-    duplicate_key=['order_date'],
-    distributed_by=['order_date'],
-    buckets=1,
-    properties={'replication_num': '1'}
-) }}
-
-select order_date, sum(amount) as sales
-from {{ ref('partition_base_orders') }}
-group by order_date
-"""
 
 SOURCE_ALIAS_YML = """
 version: 2
@@ -261,81 +218,6 @@ class TestDorisMaterializedViewPersistDocs:
         assert _column_comments(project, enabled)["sales"] == (
             "Gross sales after returns"
         )
-
-
-class TestDorisMaterializedViewPartitionRefresh:
-    @pytest.fixture(scope="class")
-    def models(self):
-        return {
-            "partition_base_orders.sql": PARTITION_BASE_SQL,
-            "mv_partition_refresh.sql": PARTITION_MV_SQL,
-        }
-
-    def test_partition_refresh_returns_task_and_records_partial_refresh(
-        self,
-        project,
-    ):
-        initial_results = run_dbt(["run"])
-        assert len(initial_results) == 2
-
-        relation = relation_from_name(project.adapter, "mv_partition_refresh")
-        partitions = project.run_sql(
-            f"show partitions from {relation}",
-            fetch="all",
-        )
-        july_partition = next(
-            str(row[1])
-            for row in partitions
-            if "2026-08-01" in str(row[6])
-            and "2026-09-01" not in str(row[6])
-        )
-        set_model_file(
-            project,
-            relation,
-            PARTITION_MV_SQL.replace(
-                "refresh_partitions=['p202607']",
-                f"refresh_partitions=['{july_partition}']",
-            ),
-        )
-        project.run_sql(
-            "insert into partition_base_orders values "
-            "(cast('2026-07-01' as date), 3, 25)"
-        )
-
-        refresh_results = run_dbt(
-            ["run", "--select", "mv_partition_refresh"]
-        )
-        assert len(refresh_results) == 1
-
-        response = refresh_results[0].adapter_response
-        response_message = response["_message"]
-        assert response["code"] == "REFRESH MATERIALIZED VIEW"
-        assert response["task_status"] == "SUCCESS"
-        match = re.search(
-            r"refresh task (?P<task_id>\S+) SUCCESS",
-            response_message,
-        )
-        assert match is not None, response_message
-        assert response["task_id"] == match.group("task_id")
-
-        task = project.run_sql(
-            "select TaskId, Status, RefreshMode, NeedRefreshPartitions "
-            "from tasks('type'='mv') "
-            f"where MvDatabaseName = '{relation.schema}' "
-            f"and MvName = '{relation.identifier}' "
-            "order by CreateTime desc, TaskId desc limit 1",
-            fetch="one",
-        )
-        assert str(task[0]) == match.group("task_id")
-        assert task[1] == "SUCCESS"
-        assert task[2] == "PARTIAL"
-        assert json.loads(task[3]) == [july_partition]
-
-        rows = project.run_sql(
-            f"select order_date, sales from {relation} order by order_date",
-            fetch="all",
-        )
-        assert [row[1] for row in rows] == [125, 200]
 
 
 class TestDorisMaterializedViewSourceAliasAndSchema:

@@ -344,9 +344,7 @@ class DorisConfig(AdapterConfig):
     refresh_method: str = "auto"
     refresh_trigger: str = "manual"
     refresh_schedule: Optional[Dict[str, Any]] = None
-    refresh_partitions: Optional[Union[str, List[str]]] = None
     distribution_type: Optional[str] = None
-    refresh_on_run: bool = False
     wait_for_refresh: bool = True
     refresh_wait_timeout: int = 300
     refresh_poll_interval: int = 1
@@ -394,7 +392,6 @@ class DorisAdapter(SQLAdapter):
             "create": "CREATE MATERIALIZED VIEW",
             "replace": "REPLACE MATERIALIZED VIEW",
             "replace_type": "CREATE MATERIALIZED VIEW",
-            "refresh": "REFRESH MATERIALIZED VIEW",
             "skip": "skip",
             "continue": "skip",
         }

@@ -110,26 +110,6 @@
             "materialized view refresh_schedule is only valid when refresh_trigger is schedule."
         ) }}
     {%- endif -%}
-    {%- set refresh_partitions = doris__materialized_view_identifier_values(
-        'refresh_partitions',
-        config.get('refresh_partitions')
-    ) -%}
-    {%- if refresh_partitions and config.get('partition_by') is none -%}
-        {{ exceptions.raise_compiler_error(
-            "materialized view refresh_partitions requires partition_by because "
-            ~ "Doris only supports specified-partition refresh for a partitioned "
-            ~ "asynchronous materialized view."
-        ) }}
-    {%- endif -%}
-    {%- if (
-        refresh_partitions
-        and config.get('refresh_on_run', false) is not sameas true
-    ) -%}
-        {{ exceptions.raise_compiler_error(
-            "materialized view refresh_partitions requires refresh_on_run=true; "
-            ~ "otherwise dbt run would never submit the configured refresh."
-        ) }}
-    {%- endif -%}
 {%- endmacro %}
 
 {% macro doris__materialized_view_refresh_clause() -%}
@@ -413,12 +393,6 @@
     ) %}
     {% do doris__materialized_view_partition_expression() %}
     {% do doris__materialized_view_effective_properties() %}
-    {%- set refresh_on_run = config.get('refresh_on_run', false) -%}
-    {%- if refresh_on_run is not boolean -%}
-        {{ exceptions.raise_compiler_error(
-            "materialized view refresh_on_run must be true or false."
-        ) }}
-    {%- endif -%}
     {%- set wait_for_refresh = config.get('wait_for_refresh', true) -%}
     {%- if wait_for_refresh is not boolean -%}
         {{ exceptions.raise_compiler_error(
@@ -711,13 +685,7 @@
     {%- elif definition_state == 'pending' -%}
         {{ return('replace') }}
     {%- elif definition_state == 'complete' or definition_state is sameas true -%}
-        {%- set refresh_on_run = config.get('refresh_on_run', false) -%}
-        {%- if refresh_on_run is not boolean -%}
-            {{ exceptions.raise_compiler_error(
-                "materialized view refresh_on_run must be true or false."
-            ) }}
-        {%- endif -%}
-        {{ return('refresh' if refresh_on_run else 'skip') }}
+        {{ return('skip') }}
     {%- endif -%}
 
     {%- set on_configuration_change = (
@@ -739,31 +707,6 @@
             ~ on_configuration_change ~ "'. Expected one of: apply, continue, fail."
         ) }}
     {%- endif -%}
-{%- endmacro %}
-
-{% macro doris__get_refresh_materialized_view_sql(relation) -%}
-    {% do doris__validate_materialized_view_refresh_config() %}
-    {%- set refresh_partitions = doris__materialized_view_identifier_values(
-        'refresh_partitions',
-        config.get('refresh_partitions')
-    ) -%}
-    {%- if refresh_partitions -%}
-        refresh materialized view {{ relation }}
-        {{ 'partition' if refresh_partitions | length == 1 else 'partitions' }}
-        ({{ doris__materialized_view_identifier_list(
-            refresh_partitions,
-            'refresh_partitions'
-        ) }})
-    {%- else -%}
-        {%- set refresh_method = (
-            config.get('refresh_method', 'auto') or 'auto'
-        ) | trim | lower -%}
-        refresh materialized view {{ relation }} {{ refresh_method }}
-    {%- endif -%}
-{%- endmacro %}
-
-{% macro doris__refresh_materialized_view(relation) -%}
-    {{ doris__get_refresh_materialized_view_sql(relation) }}
 {%- endmacro %}
 
 {% macro doris__drop_materialized_view(relation) -%}
@@ -1016,7 +959,7 @@
         {% do adapter.validate_materialized_view_version(frontends) %}
     {%- endif -%}
     {#-- Doris DCL is non-transactional. Validate every requested principal
-         before CREATE, REPLACE, REFRESH, or type-switch DDL can expose a new
+         before CREATE, REPLACE, or type-switch DDL can expose a new
          target definition. --#}
     {% do doris__preflight_grants(target_relation, grant_config) %}
     {#-- Outside-transaction pre-hooks may set session state used by metadata
@@ -1149,20 +1092,6 @@
                 ) %}
             {%- endif -%}
 
-        {%- elif action == 'refresh' -%}
-            {%- set previous_task_ids = [] -%}
-            {%- if config.get('wait_for_refresh', true) -%}
-                {%- set previous_task_ids =
-                    doris__materialized_view_task_ids(target_relation)
-                -%}
-            {%- endif -%}
-            {% call statement('main') %}
-                {{ doris__get_refresh_materialized_view_sql(target_relation) }}
-            {% endcall %}
-            {% set refresh_task = doris__wait_for_materialized_view_refresh(
-                target_relation,
-                previous_task_ids
-            ) %}
         {%- endif -%}
 
     {%- endif -%}

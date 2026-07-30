@@ -2,7 +2,9 @@
 
 dbt Model 配置 `materialized='materialized_view'` 后，dbt-doris 会把编译后的
 Model 查询创建为 Doris Async Materialized View。`ref()`、`source()`、Alias、
-目标 Schema、Hook、血缘、测试和文档仍由 dbt 管理，刷新任务由 Doris 执行。
+目标 Schema、Hook、血缘、测试和文档仍由 dbt 管理。dbt-doris 部署
+CREATE/REPLACE/DROP 和刷新策略 DDL；Doris 负责部署后的刷新执行、触发时机和
+分区选择。
 
 本 Materialization **只管理 Doris 异步物化视图**。Doris Sync Materialized
 View（Rollup）具有不同的 DDL 和生命周期，不在本实现范围内。
@@ -52,23 +54,21 @@ AS
 select ...;
 ```
 
-默认 `refresh_on_run=false`。首次 `dbt run` 创建定义并等待
-`BUILD IMMEDIATE` 的刷新任务成功；以后定义未变化时保持幂等，不重复创建，
-也不主动刷新。
+首次 `dbt run` 创建定义并等待 `BUILD IMMEDIATE` 产生的首次任务成功；以后
+定义未变化时保持幂等，不重复创建，也不提交
+`REFRESH MATERIALIZED VIEW`。后续刷新由 Doris 按 DDL 中的策略管理。
 
 ## 配置
 
 | Config | 默认值 | 支持值或格式 | 作用 |
 | --- | --- | --- | --- |
 | `build_mode` | `immediate` | `immediate`、`deferred` | 创建后立即构建，或推迟到以后刷新 |
-| `refresh_method` | `auto` | `auto`、`complete` | 让 Doris 自动选择刷新范围，或强制完整刷新 |
-| `refresh_trigger` | `manual` | `manual`、`schedule`、`commit` | 手动、定时或底表提交后触发 |
+| `refresh_method` | `auto` | `auto`、`complete` | 写入 MV DDL，让 Doris 自动选择刷新范围或执行完整刷新 |
+| `refresh_trigger` | `manual` | `manual`、`schedule`、`commit` | 写入 MV DDL，由 Doris 按手动、定时或底表提交触发 |
 | `refresh_schedule` | 无 | `interval`、`unit`、可选 `start_time` | 仅用于 `schedule`；生产 Unit 为 minute/hour/day/week |
-| `refresh_on_run` | `false` | Boolean | 定义不变时，每次 `dbt run` 是否主动提交刷新 |
-| `refresh_partitions` | 无 | 分区名或分区名列表 | 分区 MV 在 `refresh_on_run=true` 时生成 `PARTITION(S)` |
-| `wait_for_refresh` | `true` | Boolean | 是否等待本次 Adapter 提交的刷新任务结束 |
-| `refresh_wait_timeout` | `300` | 正整数秒 | 等待刷新任务的总超时 |
-| `refresh_poll_interval` | `1` | 正整数秒 | 查询 Doris Task 状态的间隔，不能大于总超时 |
+| `wait_for_refresh` | `true` | Boolean | 是否等待 `BUILD IMMEDIATE` 产生的首次任务结束 |
+| `refresh_wait_timeout` | `300` | 正整数秒 | 等待首次构建任务的总超时 |
+| `refresh_poll_interval` | `1` | 正整数秒 | 查询首次构建 Task 状态的间隔，不能大于总超时 |
 | `duplicate_key` | 无 | 列名或列名列表 | 生成 `DUPLICATE KEY` |
 | `partition_by` | 无 | 字符串或单元素列表 | 一个分区列或 Doris 支持的分区映射函数 |
 | `distribution_type` | 自动判断 | `hash`、`random` | 设置分布方式 |
@@ -109,53 +109,36 @@ group by order_date, customer_id
 `refresh_schedule` 不能用于 `manual` 或 `commit`，`unit='second'` 会在执行
 DDL 前被拒绝。
 
-## 主动刷新、指定分区和任务结果
+## 刷新责任边界和首次构建任务
 
-定义未变化时，可通过下面的配置让本次 `dbt run` 主动刷新：
+dbt Model 的正常生命周期只部署 MV 定义：创建、原子替换、删除对象，并把
+`REFRESH AUTO/COMPLETE`、`ON MANUAL/SCHEDULE/COMMIT` 和 Schedule 写入 DDL。
+定义未变化时直接跳过，不提交 `REFRESH MATERIALIZED VIEW`。部署完成后的刷新
+执行、触发时机和分区选择均由 Doris 管理，不通过 Model Config 指定某次刷新
+或刷新分区。
 
-```sql
-{{ config(
-    materialized='materialized_view',
-    refresh_on_run=true,
-    partition_by='order_date',
-    refresh_partitions=['p202607', 'p202608'],
-    wait_for_refresh=true,
-    refresh_wait_timeout=600,
-    refresh_poll_interval=2
-) }}
-```
+Adapter 只等待新定义使用 `BUILD IMMEDIATE` 时产生的首次任务，包括首次创建
+和重建临时 MV：
 
-生成的核心 SQL 是：
-
-```sql
-REFRESH MATERIALIZED VIEW `analytics`.`daily_sales`
-PARTITIONS (`p202607`, `p202608`);
-```
-
-没有 `refresh_partitions` 时，主动刷新使用 `refresh_method` 对应的
-`AUTO` 或 `COMPLETE`。分区名由 Adapter 作为标识符引用，不接受任意 SQL
-表达式。`refresh_partitions` 必须同时配置 `partition_by` 和
-`refresh_on_run=true`；否则 Adapter 会在提交 SQL 前给出明确错误。
-
-刷新是 Doris 异步任务，但 Adapter 默认不会只确认 SQL 提交成功：
-
-1. 提交前记录该 MV 已有 Task ID；
-2. 提交后轮询 `tasks('type'='mv')` 中本次新增任务；
-3. `SUCCESS` 才完成 Model，并在 dbt Adapter Response 中返回 Task ID、
-   Status，以及 Doris 提供时的 Last Query ID；
+1. 执行 CREATE 前记录该 MV 已有 Task ID；
+2. CREATE 后轮询 `tasks('type'='mv')` 中本次新增的首次构建任务；
+3. `SUCCESS` 才完成部署，并在 dbt Adapter Response 中返回 Task ID、Status，
+   以及 Doris 提供时的 Last Query ID；
 4. `FAILED`、`CANCELED`、未知状态或超时都会让 Model 失败，并携带任务错误。
 
-只有明确配置 `wait_for_refresh=false` 时才不等待。等待依赖 Doris 保留 MV
-Task History；若任务历史被关闭或过早清理，Adapter 会超时并给出提示。
+只有明确配置 `wait_for_refresh=false` 时才不等待这个首次任务。
+`refresh_wait_timeout` 和 `refresh_poll_interval` 也只控制首次任务的等待。
+等待依赖 Doris 保留 MV Task History；若任务历史被关闭或过早清理，Adapter
+会超时并给出提示。`BUILD DEFERRED` 不产生需要 Adapter 等待的首次任务。
 
 ## `dbt run` 如何处理已有对象
 
 | 场景 | 行为 |
 | --- | --- |
 | 目标不存在 | 创建异步物化视图 |
-| 定义未变化 | 跳过；`refresh_on_run=true` 时主动刷新 |
+| 定义未变化 | 跳过，不提交刷新 |
 | Model SQL、Persisted Docs 或 MV DDL Config 变化 | 按 `on_configuration_change` 处理 |
-| `on_configuration_change='apply'` | 构建临时 MV；Immediate 等刷新成功后原子 Replace，Deferred 不等待首次刷新 |
+| `on_configuration_change='apply'` | 构建临时 MV；Immediate 等首次构建成功后原子 Replace，Deferred 不等待首次任务 |
 | `on_configuration_change='continue'` | 保留 Doris 中的旧定义并给出警告 |
 | `on_configuration_change='fail'` | 终止运行，不修改已有对象 |
 | 使用 `--full-refresh` | 忽略变化策略，重新部署完整 MV 定义 |
@@ -170,13 +153,14 @@ dbt-doris 在 MV Comment 中保存部署状态和定义 Hash。Hash 对 SQL 与�
 版本。
 
 已有 MV 的结构变化不会先删除线上对象。Adapter 先创建临时 MV；Immediate 等待
-刷新成功后再用 Doris 原子 Swap 暴露新定义，Deferred 按其语义不提交首次刷新。
+新定义的首次构建成功后再用 Doris 原子 Swap 暴露新定义，Deferred 按其语义不
+发起首次构建。
 类型切换使用备份 Relation，失败时尽量保留旧对象。
 残留的 `__dbt_tmp` 或 `__dbt_backup` 对象会在后续运行中按部署状态恢复或清理。
 
 Outside-transaction Pre-hook 在 `SHOW CREATE MATERIALIZED VIEW` 和定义漂移检查前
 执行，因此 Hook 设置的 Session 状态可影响这些元数据查询。Inside Hook 只在实际
-创建、替换或刷新动作中执行；Outside Post-hook 在清理流程之后执行。
+创建或替换动作中执行；Outside Post-hook 在清理流程之后执行。
 
 `--full-refresh` 是重新部署 MV 定义，不等于只执行
 `REFRESH MATERIALIZED VIEW ... COMPLETE`。
@@ -240,12 +224,12 @@ models:
 - `grants_mode='additive'`：只增加配置中的授权，不回收已有授权。
 
 Replace 只管理目标 Relation 的直接 Table Privileges，不撤销从 Global、
-Catalog、Database 或其他 Role 继承的权限。创建、替换、刷新、跳过和
+Catalog、Database 或其他 Role 继承的权限。创建、替换、跳过和
 `on_configuration_change='continue'` 路径都会应用 Grants，因此项目级
 `+grants` 不会让 MV 编译失败，也不会在幂等运行时被忽略。
 
-所有模式都会先用 `SHOW ROLES` 一次性验证配置中的 User/Role；MV 在任何创建、
-替换或刷新 DDL 前完成该预检。不存在的 Principal 会让 Model 失败，且不会暴露
+所有模式都会先用 `SHOW ROLES` 一次性验证配置中的 User/Role；MV 在任何创建或
+替换 DDL 前完成该预检。不存在的 Principal 会让 Model 失败，且不会暴露
 新的 MV 定义或执行部分授权。Doris User 名按大小写精确匹配，Role 和 Host
 按 Doris 的大小写规则比较。
 
@@ -258,11 +242,10 @@ Catalog、Database 或其他 Role 继承的权限。创建、替换、刷新、�
 
 - `partition_by` 只接受一个分区标识符或 Doris 支持的分区映射函数；多列或任意
   SQL 片段会在 Adapter 校验阶段失败。
-- `refresh_partitions` 是 Doris 分区名，不是 Model 输出列名或分区表达式。
 - 单 BE 开发集群应设置 `replication_num=1`；顶层值优先于
   `properties.replication_num`。
-- 刷新超时时先检查 `tasks('type'='mv')`、Task History 保留设置和 Doris 返回的
-  ErrorMsg/LastQueryId。
+- 首次构建任务超时时先检查 `tasks('type'='mv')`、Task History 保留设置和
+  Doris 返回的 ErrorMsg/LastQueryId。
 - `refresh_trigger='commit'` 仅在底表变更满足 Doris ON COMMIT 语义时触发，
   Adapter 不模拟 Commit 调度。
 - 不要手动删除或修改 MV Comment 中的 `dbt-doris:` 部署标记。

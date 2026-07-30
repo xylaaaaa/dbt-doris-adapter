@@ -89,11 +89,6 @@ DAILY_SALES_ASYNC_FAILURE_SQL = DAILY_SALES_IMMEDIATE_CHANGED_SQL.replace(
     "as sales",
 )
 
-DAILY_SALES_REFRESH_ON_RUN_SQL = DAILY_SALES_IMMEDIATE_SQL.replace(
-    "refresh_trigger='manual',",
-    "refresh_trigger='manual',\n    refresh_on_run=true,",
-)
-
 DAILY_SALES_ON_COMMIT_SQL = DAILY_SALES_MV_SQL.replace(
     "refresh_method='complete'",
     "refresh_method='auto'",
@@ -330,6 +325,19 @@ class TestDorisMaterializedViewLifecycle:
             (rows[1][0], 50),
         ]
 
+        doris_task_ids = materialized_view_task_ids(project, relation)
+        project.run_sql(
+            "insert into base_orders values "
+            "(4, cast('2026-07-03' as date), 75)"
+        )
+        unchanged_run = run_dbt(["run", "--select", "daily_sales"])
+        assert len(unchanged_run) == 1
+        assert materialized_view_task_ids(project, relation) == doris_task_ids
+        assert project.run_sql(
+            f"select order_date, sales from {relation} order by order_date",
+            fetch="all",
+        ) == rows
+
 
 class TestDorisMaterializedViewChanges:
     @pytest.fixture(scope="class")
@@ -414,44 +422,6 @@ class TestDorisMaterializedViewChanges:
             fetch="all",
         )
         assert temporary_relations == []
-
-
-class TestDorisMaterializedViewRefreshOnRun:
-    @pytest.fixture(scope="class")
-    def models(self):
-        return {
-            "base_orders.sql": BASE_ORDERS_SQL,
-            "daily_sales_refresh.sql": DAILY_SALES_REFRESH_ON_RUN_SQL,
-        }
-
-    def test_refresh_on_run_waits_until_new_data_is_queryable(self, project):
-        run_dbt(["run"])
-        relation = relation_from_name(project.adapter, "daily_sales_refresh")
-        initial_rows = project.run_sql(
-            f"select order_date, sales from {relation} order by order_date",
-            fetch="all",
-        )
-        assert [row[1] for row in initial_rows] == [300, 50]
-
-        project.run_sql(
-            "insert into base_orders values "
-            "(4, cast('2026-07-03' as date), 75)"
-        )
-        run_dbt(["run", "--select", "daily_sales_refresh"])
-
-        refreshed_rows = project.run_sql(
-            f"select order_date, sales from {relation} order by order_date",
-            fetch="all",
-        )
-        assert [row[1] for row in refreshed_rows] == [300, 50, 75]
-        latest_task = project.run_sql(
-            "select Status from tasks('type'='mv') "
-            f"where MvDatabaseName = '{relation.schema}' "
-            f"and MvName = '{relation.identifier}' "
-            "order by CreateTime desc, TaskId desc limit 1",
-            fetch="one",
-        )
-        assert latest_task == ("SUCCESS",)
 
 
 class TestDorisMaterializedViewOnCommit:

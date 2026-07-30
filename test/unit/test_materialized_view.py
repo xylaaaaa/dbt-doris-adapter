@@ -253,13 +253,6 @@ def test_definition_hash_changes_with_model_sql_or_ddl_config():
         ("table", False, False, {}, "replace_type"),
         ("view", False, False, {}, "replace_type"),
         ("materialized_view", True, False, {}, "skip"),
-        (
-            "materialized_view",
-            True,
-            False,
-            {"refresh_on_run": True},
-            "refresh",
-        ),
         ("materialized_view", False, False, {}, "replace"),
         (
             "materialized_view",
@@ -380,56 +373,10 @@ def test_definition_match_reads_the_hash_from_show_create():
     ) == "pending"
 
 
-def test_refresh_sql_uses_the_configured_doris_refresh_method():
-    runner = materialized_view_runner(config={"refresh_method": "complete"})
-
-    sql = runner.sql(
-        "doris__get_refresh_materialized_view_sql",
-        FakeRelation(relation_type="materialized_view"),
-    )
-
-    assert sql == "refresh materialized view `dbt_test`.`my_model` complete"
-
-
-@pytest.mark.parametrize(
-    ("partitions", "expected"),
-    [
-        ("p202607", "partition (`p202607`)"),
-        (
-            ["p202607", "p202608"],
-            "partitions (`p202607`, `p202608`)",
-        ),
-    ],
-)
-def test_refresh_sql_supports_one_or_more_doris_mv_partitions(
-    partitions,
-    expected,
-):
-    runner = materialized_view_runner(
-        config={
-            "refresh_method": "complete",
-            "refresh_partitions": partitions,
-            "partition_by": "order_date",
-            "refresh_on_run": True,
-        }
-    )
-
-    sql = runner.sql(
-        "doris__get_refresh_materialized_view_sql",
-        FakeRelation(relation_type="materialized_view"),
-    )
-
-    assert sql == f"refresh materialized view `dbt_test`.`my_model` {expected}"
-    assert not sql.endswith(" complete")
-
-
-def test_core_materialized_view_dispatch_helpers_use_doris_sql():
-    runner = materialized_view_runner(config={"refresh_method": "complete"})
+def test_core_materialized_view_dispatch_helpers_use_doris_ddl():
+    runner = materialized_view_runner()
     relation = FakeRelation(relation_type="materialized_view")
 
-    assert runner.sql("doris__refresh_materialized_view", relation) == (
-        "refresh materialized view `dbt_test`.`my_model` complete"
-    )
     assert runner.sql("doris__drop_materialized_view", relation) == (
         "drop materialized view if exists `dbt_test`.`my_model`"
     )
@@ -676,7 +623,7 @@ def test_materialization_first_deferred_run_creates_the_target_without_waiting()
     assert "refresh task" not in raw_results[-1]["message"]
 
 
-def test_materialization_same_definition_is_a_true_no_op():
+def test_unchanged_materialized_view_leaves_refresh_management_to_doris():
     definition_hash = materialized_view_runner().render(
         "doris__materialized_view_definition_hash",
         "",
@@ -695,6 +642,7 @@ def test_materialization_same_definition_is_a_true_no_op():
     assert [statement.name for statement in runner.statements] == ["drop_relation"]
     assert adapter.events == []
     assert adapter.hook_events == [("pre", False), ("post", False)]
+    assert not any("tasks('type'='mv')" in query for query in runner.run_queries)
     assert raw_results[0]["code"] == "skip"
 
 
@@ -761,41 +709,6 @@ def test_materialization_definition_change_builds_then_atomically_swaps():
             "create materialized view my_model "
             "comment 'dbt-doris:definition-hash=stale' as select 0"
         ),
-    )
-
-    runner.render("materialization_materialized_view_doris")
-
-    assert [statement.name for statement in runner.statements] == [
-        "create_materialized_view_intermediate",
-        "main",
-        "mark_materialized_view_deployment_complete",
-        "drop_relation",
-    ]
-    assert "build immediate" in runner.statements[0].sql.lower()
-    assert "replace with materialized view `my_model__dbt_tmp`" in (
-        " ".join(runner.statements[1].sql.split())
-    )
-    assert 'properties("swap" = "true")' in runner.statements[1].sql
-    assert adapter.events == [("commit",)]
-    assert raw_results[-1]["code"] == "REPLACE MATERIALIZED VIEW"
-    assert "refresh task 1 SUCCESS" in raw_results[-1]["message"]
-
-
-def test_materialization_refresh_on_run_recognizes_a_lower_new_task_id():
-    definition_hash = materialized_view_runner(
-        config={"refresh_on_run": True}
-    ).render(
-        "doris__materialized_view_definition_hash",
-        "",
-    )
-    existing = FakeRelation(relation_type="materialized_view")
-    runner, adapter, raw_results = materialization_runner(
-        existing_relation=existing,
-        show_create_sql=(
-            "create materialized view my_model "
-            f"comment 'dbt-doris:definition-hash={definition_hash}' as"
-        ),
-        config={"refresh_on_run": True},
         previous_task_ids=["50", "41"],
         refresh_task_rows=[
             [
@@ -816,10 +729,16 @@ def test_materialization_refresh_on_run_recognizes_a_lower_new_task_id():
     runner.render("materialization_materialized_view_doris")
 
     assert [statement.name for statement in runner.statements] == [
+        "create_materialized_view_intermediate",
         "main",
+        "mark_materialized_view_deployment_complete",
         "drop_relation",
     ]
-    assert runner.statements[0].sql.endswith(" auto")
+    assert "build immediate" in runner.statements[0].sql.lower()
+    assert "replace with materialized view `my_model__dbt_tmp`" in (
+        " ".join(runner.statements[1].sql.split())
+    )
+    assert 'properties("swap" = "true")' in runner.statements[1].sql
     refresh_queries = [
         query
         for query in runner.run_queries
@@ -827,9 +746,12 @@ def test_materialization_refresh_on_run_recognizes_a_lower_new_task_id():
     ]
     assert refresh_queries
     assert all(">" not in query for query in refresh_queries)
-    assert sum(query.lower().startswith("select sleep(") for query in runner.run_queries) == 2
+    assert sum(
+        query.lower().startswith("select sleep(")
+        for query in runner.run_queries
+    ) == 2
     assert adapter.events == [("commit",)]
-    assert raw_results[-1]["code"] == "REFRESH MATERIALIZED VIEW"
+    assert raw_results[-1]["code"] == "REPLACE MATERIALIZED VIEW"
     assert "refresh task 40 SUCCESS" in raw_results[-1]["message"]
     assert "query query-40" in raw_results[-1]["message"]
     assert raw_results[-1]["response"].task_id == "40"
@@ -1571,25 +1493,6 @@ def test_invalid_build_mode_fails_before_sql_execution():
             },
             "refresh_schedule.*only valid.*schedule",
         ),
-        ({"refresh_partitions": []}, "refresh_partitions.*must not be empty"),
-        (
-            {"refresh_partitions": ["p202607", 1]},
-            "refresh_partitions.*non-empty string",
-        ),
-        (
-            {
-                "refresh_partitions": ["p202607"],
-                "refresh_on_run": True,
-            },
-            "refresh_partitions.*requires partition_by",
-        ),
-        (
-            {
-                "refresh_partitions": ["p202607"],
-                "partition_by": "order_date",
-            },
-            "refresh_partitions.*requires refresh_on_run=true",
-        ),
     ],
 )
 def test_invalid_refresh_config_fails_before_sql_execution(config, message):
@@ -1660,7 +1563,6 @@ def test_invalid_distribution_config_fails_before_sql_execution(config, message)
         ),
         ({"replication_num": 0}, "replication_num.*positive integer"),
         ({"replication_num": "many"}, "replication_num.*positive integer"),
-        ({"refresh_on_run": "yes"}, "refresh_on_run.*true.*false"),
         ({"wait_for_refresh": "yes"}, "wait_for_refresh.*true.*false"),
         ({"refresh_wait_timeout": 0}, "refresh_wait_timeout.*positive integer"),
         ({"refresh_poll_interval": 0}, "refresh_poll_interval.*positive integer"),

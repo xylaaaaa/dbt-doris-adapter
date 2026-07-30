@@ -86,12 +86,12 @@ Issue 没有进一步定义：
 
 - dbt Config 的具体名称；
 - 默认刷新方式；
-- 重复执行 `dbt run` 时是否主动刷新；
+- 重复执行 `dbt run` 时如何处理已有定义；
 - Model SQL 或刷新配置变化时怎样更新对象；
 - `--full-refresh` 的行为；
 - 如何从 Doris 元数据中识别异步物化视图；
 - 支持哪些 Doris 版本；
-- 是否等待异步刷新完成；
+- 是否等待 `BUILD IMMEDIATE` 产生的首次异步任务；
 - 是否包含暂停、恢复、取消和刷新状态监控。
 
 因此，“生成一条 CREATE SQL”是这个 Issue 的起点，不是完整的完成标准。
@@ -129,13 +129,13 @@ dbt-doris 负责：
 - 识别 Doris 专用 Config；
 - 生成 Doris Async MV SQL；
 - 从 Doris 元数据中识别已有对象；
-- 把 dbt 的创建、刷新、变化和删除动作映射到 Doris SQL。
+- 把 dbt 的创建、替换和删除动作以及刷新策略映射到 Doris DDL。
 
 Doris 负责：
 
 - 创建并保存异步物化视图；
-- 创建和执行刷新任务；
-- 维护分区刷新状态；
+- 按 DDL 策略创建和执行后续刷新任务；
+- 选择刷新分区并维护分区刷新状态；
 - 执行查询和透明查询改写。
 
 ## 3. 期望的用户使用方式
@@ -143,7 +143,7 @@ Doris 负责：
 下面是为了把 Issue 变成可实现需求而给出的**建议接口**。Issue 原文没有确定这些
 Config 名称，合入前仍需由维护者确认。
 
-### 3.1 手动刷新型异步物化视图
+### 3.1 使用 `ON MANUAL` 刷新策略的异步物化视图
 
 ```sql
 -- models/mv_daily_sales.sql
@@ -190,6 +190,10 @@ select
 from `analytics`.`fct_orders`
 group by order_date, customer_id;
 ```
+
+`dbt run` 负责部署以上定义和刷新策略，不执行
+`REFRESH MATERIALIZED VIEW`。部署后的手动刷新、刷新范围和分区选择属于 Doris
+运维范围。
 
 ### 3.2 定时刷新型异步物化视图
 
@@ -270,7 +274,7 @@ Materialized View 的 `AS <query>` 必须使用 dbt 编译后的 SQL，因此：
 
 - 明确生成异步物化视图语法；
 - 正确引用 Database 和对象名；
-- 按 Doris 语法顺序输出刷新、Key、分区、分布、属性和查询；
+- 按 Doris 语法顺序输出刷新策略、Key、分区、分布、属性和查询；
 - 正确引用标识符并转义注释、属性值；
 - 不把 Doris Sync MV 误当成此 Materialization 的实现。
 
@@ -284,8 +288,8 @@ dbt-doris 必须把已有 Doris Async MV 识别成
 ```sql
 DROP MATERIALIZED VIEW ...
 SHOW CREATE MATERIALIZED VIEW ...
-REFRESH MATERIALIZED VIEW ...
 ALTER MATERIALIZED VIEW ...
+REPLACE WITH MATERIALIZED VIEW ...
 ```
 
 而不是错误地执行 `DROP TABLE` 或 Table 替换逻辑。
@@ -298,21 +302,16 @@ ALTER MATERIALIZED VIEW ...
 - 第二次运行不会因对象已存在而失败；
 - 不会把已有 Async MV 当作 Table 删除；
 - 不会在每次运行中无条件 Drop/Create；
-- 是否在无变化时主动刷新必须有明确、稳定、已测试的行为。
+- 定义未变化时跳过，不提交显式刷新。
 
 dbt 官方把 Materialized View 的 `dbt run` 主要视为定义和配置的部署动作，
-而数据刷新通常由数据库管理。但 dbt Core v1 的默认 Materialized View
-Materialization 也提供 `refresh_materialized_view` Adapter 接口。
+而数据刷新通常由数据库管理。dbt-doris 采用相同边界：Model 生命周期只部署
+CREATE/REPLACE/DROP 和刷新策略 DDL，不提供让普通 `dbt run` 主动刷新或指定
+刷新分区的 Model Config。后续刷新执行、触发时机和分区选择由 Doris 管理。
 
-dbt-doris 最终采用下面第 3 种语义：
-
-1. 每次无变化的 `dbt run` 都执行 `REFRESH MATERIALIZED VIEW ...`；
-2. 只有 `ON MANUAL` 时刷新；
-3. 默认不刷新，由单独 Config 控制；
-4. 无论采用哪种方式，都不能让定时或 `ON COMMIT` 刷新产生意外的重复任务。
-
-具体入口是 `refresh_on_run`；默认 `false`，显式设置为 `true` 才在无变化运行中
-提交刷新。
+`BUILD IMMEDIATE` 是部署完成语义的特例：CREATE 新定义时，Adapter 等待 Doris
+产生的首次构建任务成功，再把新定义视为可用；这不会把后续刷新纳入 dbt
+生命周期。
 
 ### R6. 处理 SQL 和配置变化
 
@@ -393,7 +392,7 @@ Materialization 至少应正确处理：
 - 最小可运行示例；
 - Manual、Schedule、Commit 三种刷新方式；
 - AUTO 与 COMPLETE 的区别；
-- `dbt run` 是否触发刷新；
+- `dbt run` 不触发部署后的刷新；
 - `--full-refresh` 与 `REFRESH ... COMPLETE` 的区别；
 - Config 列表和默认值；
 - Doris 与 dbt Core 的版本要求；
@@ -405,26 +404,26 @@ Materialization 至少应正确处理：
 ### 6.1 Materialization 与 Relation 生命周期
 
 Adapter 已注册 Doris 专用 `materialized_view` Materialization，并提供 Async MV
-创建、刷新、Drop、Rename、Relation Type 识别和配置变化处理。Relation Cache
-会结合 `mv_infos` 把 Async MV 补全为 Materialized View，而不是依赖
+Create、Replace、Drop、Rename、Relation Type 识别和配置变化处理。Relation
+Cache 会结合 `mv_infos` 把 Async MV 补全为 Materialized View，而不是依赖
 `information_schema.tables` 中容易误判的 `BASE TABLE`。
 
 Table、View 和 Async MV 之间切换时按真实对象类型使用对应 DDL。结构变化和
-`--full-refresh` 先构建临时 MV；Immediate 刷新成功后再使用 Doris
-`REPLACE WITH MATERIALIZED VIEW` 原子替换，Deferred 按其语义不提交首次刷新。
+`--full-refresh` 先构建临时 MV；Immediate 首次构建成功后再使用 Doris
+`REPLACE WITH MATERIALIZED VIEW` 原子替换，Deferred 按其语义不发起首次构建。
 部署 Comment 的 Pending/Complete 标记与备份 Relation 用于识别和恢复中断部署。
 
-### 6.2 Config、刷新与可观测性
+### 6.2 Config、刷新策略与首次构建可观测性
 
-`DorisConfig` 已声明 Build、Refresh、Schedule、指定刷新分区、Distribution、
-Bucket、Properties、等待超时和轮询间隔等类型。Jinja Macro 会归一化枚举值，
-校验不合法组合，并引用标识符和转义字符串。
+`DorisConfig` 已声明 Build、Refresh Method、Refresh Trigger、Schedule、分区
+定义、Distribution、Bucket、Properties、首次构建等待超时和轮询间隔等类型。
+Jinja Macro 会归一化枚举值，校验不合法组合，并引用标识符和转义字符串。
 
-默认 `BUILD IMMEDIATE` 会等待 Doris 首次刷新任务成功。定义未变化时默认跳过；
-`refresh_on_run=true` 会主动刷新，`refresh_partitions` 可选择一个或多个 Doris
-分区。Adapter 从 `tasks('type'='mv')` 识别本次任务，失败、取消、未知状态或超时
-会使 Model 失败；成功 Adapter Response 包含 Task ID、Status 和可用的
-Last Query ID。
+默认 `BUILD IMMEDIATE` 会等待 CREATE 新定义产生的 Doris 首次构建任务成功。
+定义未变化时跳过，不提交显式刷新；后续刷新与分区选择由 Doris 管理。Adapter
+只从 `tasks('type'='mv')` 识别并等待首次构建任务；失败、取消、未知状态或超时
+会使 Model 失败，成功 Adapter Response 包含 Task ID、Status 和可用的 Last
+Query ID。
 
 ### 6.3 Docs、Grants 与 Hook
 
@@ -463,7 +462,7 @@ second 会被 Adapter 拒绝。
 - Model SQL、`ref()`、`source()`、Alias 和环境 Schema；
 - BUILD IMMEDIATE/DEFERRED；
 - REFRESH AUTO/COMPLETE 与 ON MANUAL/SCHEDULE/COMMIT；
-- 指定分区刷新和 Doris Refresh Task 结果；
+- BUILD IMMEDIATE 首次构建任务等待和 Doris Task 结果；
 - Key、Partition、Distribution、Buckets、Properties 和 `replication_num`；
 - 定义 Hash、幂等运行、`on_configuration_change`、Full Refresh 和原子替换；
 - Relation/Column Persist Docs、Doris User/Role Grants 和 Hook 顺序；
@@ -505,7 +504,7 @@ dbt run --select mv_daily_sales
 - 第二次不因对象存在而失败；
 - 不错误执行 `DROP TABLE`；
 - 不遗留临时或备份对象；
-- 是否触发 Refresh 与文档声明一致。
+- 不提交 `REFRESH MATERIALIZED VIEW`，后续刷新仍由 Doris 管理。
 
 ### AC3. 三种刷新触发
 
@@ -523,8 +522,8 @@ ON COMMIT
 
 分别配置 AUTO、COMPLETE：
 
-- 创建语句正确；
-- 主动 Refresh 时生成正确 SQL；
+- CREATE 和 `SHOW CREATE MATERIALIZED VIEW` 中的刷新策略正确；
+- 后续刷新范围由 Doris 按该策略选择；
 - 非法值在执行前失败并指出具体 Config。
 
 ### AC5. 配置变化
@@ -532,7 +531,7 @@ ON COMMIT
 修改 Refresh、Property、Partition 或 Distribution：
 
 - `apply`、`continue`、`fail` 行为分别符合文档；
-- 需要重建的变化不被错误地当作简单 Refresh；
+- 需要重建的变化不被错误地当作数据刷新；
 - 失败时不静默丢失旧对象。
 
 ### AC6. Model SQL 变化
@@ -541,7 +540,7 @@ ON COMMIT
 
 - dbt 能检测定义变化；
 - 新定义最终反映到 `SHOW CREATE MATERIALIZED VIEW`；
-- 不能只刷新旧定义。
+- 必须部署新定义，不能把定义变化当作数据刷新。
 
 ### AC7. Full Refresh
 
@@ -573,7 +572,8 @@ ON COMMIT
 - Macro SQL 生成 Unit Test；
 - Config 合法值和非法组合 Unit Test；
 - Relation Type 识别 Unit Test；
-- 创建、重复运行、刷新、Full Refresh 和类型切换 Functional Test；
+- 创建、重复运行、刷新策略、首次构建任务、Full Refresh 和类型切换
+  Functional Test；
 - 有 Doris 版本边界的兼容性测试或明确跳过条件。
 
 ## 9. 已确定的实现决策
@@ -583,12 +583,12 @@ ON COMMIT
 | 默认 Build Mode | `BUILD IMMEDIATE` |
 | 默认 Refresh Method | `AUTO` |
 | 默认 Trigger | `ON MANUAL` |
-| 无变化的 `dbt run` | 默认 Skip；`refresh_on_run=true` 才主动刷新 |
+| 无变化的 `dbt run` | Skip，不提交 `REFRESH MATERIALIZED VIEW` |
 | Schedule Config | `refresh_schedule={interval, unit, start_time?}`；拒绝测试专用的 second |
 | Async MV 识别 | 结合 `mv_infos` 补全 Relation Type |
 | SQL/Config 变化 | 临时 MV 构建成功后原子 Replace |
-| Refresh 完成语义 | 默认等待 Task SUCCESS，并把任务信息放入 Adapter Response |
-| 指定分区刷新 | `refresh_partitions` 生成 Doris PARTITION/PARTITIONS |
+| 首次构建完成语义 | 只等待 `BUILD IMMEDIATE` 首次 Task SUCCESS，并把任务信息放入 Adapter Response |
+| 后续刷新与分区选择 | 由 Doris 按 MV DDL 管理 |
 | Docs | 支持 `persist_docs.relation` 与 `persist_docs.columns` |
 | Grants | 显式 User/Role Principal；Replace 或 Additive |
 | 最低 Doris 版本 | 2.1.5+、3.0.1+、3.1.x、4.x，排除 3.0.0 |
@@ -599,8 +599,8 @@ ON COMMIT
 
 1. Relation 元数据识别与 Drop；
 2. 最小 `materialized_view` 创建；
-3. Build、Refresh、Schedule 和指定分区 Config；
-4. 重复运行、主动 Refresh、任务结果和 `--full-refresh`；
+3. Build、Refresh Method/Trigger、Schedule 和分区定义 Config；
+4. 重复运行、首次构建任务结果和 `--full-refresh`；
 5. 配置差异、原子 Replace、Hook、Docs、Grants 和异常恢复；
 6. Unit Test、官方 Contract Test、Doris Functional Test 和用户文档。
 

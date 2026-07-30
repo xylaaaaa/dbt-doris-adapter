@@ -119,7 +119,7 @@ View，不作为 Incremental Strategy。
   `materialized='materialized_view'`，支持 `ref()`、`source()`、Alias 和目标
   Schema。
 - [x] 支持 `BUILD IMMEDIATE/DEFERRED`。入口：`build_mode`；Immediate 默认
-  等待首次刷新完成，Deferred 不发起首次构建。
+  等待首次构建任务完成，Deferred 不发起首次构建。
 - [x] 支持 `REFRESH AUTO/COMPLETE` 和
   `ON MANUAL/SCHEDULE/COMMIT`。入口：`refresh_method`、
   `refresh_trigger`、`refresh_schedule`；生产 Schedule Unit 为
@@ -134,12 +134,13 @@ View，不作为 Incremental Strategy。
   归一化定义 Hash、`on_configuration_change`、临时 MV 和 Doris 原子
   `REPLACE WITH MATERIALIZED VIEW`；Pre/Post Hook 与未完成部署恢复已覆盖，
   包括 Replace 后 Post-hook 失败时先原子回滚旧 MV 再重试。
-- [x] 支持手动 Refresh，并返回 Doris Refresh Task 状态。入口：
-  `refresh_on_run`、`refresh_partitions`、`wait_for_refresh`、
-  `refresh_wait_timeout`、`refresh_poll_interval`；Adapter Response 返回
-  Task ID、Status 和可用的 Last Query ID；指定分区要求同时配置
-  `partition_by` 与 `refresh_on_run=true`。
-- [x] Functional Test 覆盖创建、查询、刷新、配置变化和删除。入口：
+- [x] 明确刷新责任边界：dbt 部署 CREATE/REPLACE/DROP 和刷新策略 DDL；定义
+  未变化时跳过，不主动提交 Refresh。后续刷新执行和分区选择由 Doris 管理。
+- [x] `BUILD IMMEDIATE` 创建新定义时只等待首次任务。入口：
+  `wait_for_refresh`、`refresh_wait_timeout`、`refresh_poll_interval`；
+  Adapter Response 返回 Task ID、Status 和可用的 Last Query ID。
+- [x] Functional Test 覆盖创建、查询、刷新策略、首次构建任务、配置变化和
+  删除。入口：
   `test/functional/adapter/test_doris_materialized_view.py` 和
   `test_doris_materialized_view_basic.py`、
   `test_doris_materialized_view_complete.py` 和

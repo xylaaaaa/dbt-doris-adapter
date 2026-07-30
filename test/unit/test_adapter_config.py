@@ -34,9 +34,7 @@ MATERIALIZED_VIEW_CONFIG_FIELDS = {
     "refresh_method",
     "refresh_trigger",
     "refresh_schedule",
-    "refresh_partitions",
     "distribution_type",
-    "refresh_on_run",
     "wait_for_refresh",
     "refresh_wait_timeout",
     "refresh_poll_interval",
@@ -48,6 +46,9 @@ def test_doris_config_registers_materialized_view_fields_with_dbt():
 
     assert MATERIALIZED_VIEW_CONFIG_FIELDS <= registered_fields
     assert {"replication_num", "properties", "partition_by"} <= registered_fields
+    assert {"refresh_on_run", "refresh_partitions"}.isdisjoint(
+        registered_fields
+    )
 
 
 def test_doris_config_materialized_view_defaults_match_macros():
@@ -57,9 +58,7 @@ def test_doris_config_materialized_view_defaults_match_macros():
     assert config.refresh_method == "auto"
     assert config.refresh_trigger == "manual"
     assert config.refresh_schedule is None
-    assert config.refresh_partitions is None
     assert config.distribution_type is None
-    assert config.refresh_on_run is False
     assert config.wait_for_refresh is True
     assert config.refresh_wait_timeout == 300
     assert config.refresh_poll_interval == 1
@@ -81,9 +80,7 @@ def test_doris_config_accepts_complete_materialized_view_configuration():
             "unit": "day",
             "start_time": "2099-08-01 02:00:00",
         },
-        "refresh_partitions": ["p202607"],
         "distribution_type": "hash",
-        "refresh_on_run": True,
         "wait_for_refresh": False,
         "refresh_wait_timeout": 600,
         "refresh_poll_interval": 2,
@@ -98,8 +95,6 @@ def test_doris_config_accepts_complete_materialized_view_configuration():
         "unit": "day",
         "start_time": "2099-08-01 02:00:00",
     }
-    assert config.get("refresh_partitions") == ["p202607"]
-    assert config.get("refresh_on_run") is True
     assert config.get("wait_for_refresh") is False
 
 

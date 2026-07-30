@@ -77,14 +77,15 @@ from {{ ref('orders') }}
 group by order_date
 ```
 
-`build_mode='immediate'` is the default. The adapter builds and waits for a
-temporary MV before exposing it or atomically replacing an existing MV, so
-downstream dbt models do not observe an unfinished refresh. The wait defaults
-to 300 seconds with one-second polling and can be tuned with
-`refresh_wait_timeout` and `refresh_poll_interval`. Set
-`wait_for_refresh=false` only when asynchronous completion is intentional.
-Waiting requires Doris materialized-view task history to remain enabled so the
-adapter can identify the task submitted by the current dbt action.
+`build_mode='immediate'` is the default. When `CREATE MATERIALIZED VIEW`
+starts the initial build for a new or replacement definition, the adapter waits
+for that task before exposing the MV, so downstream dbt models do not observe
+an unfinished initial build. This is the only materialized-view task that the
+normal model lifecycle waits for. The wait defaults to 300 seconds with one-second
+polling and can be tuned with `refresh_wait_timeout` and
+`refresh_poll_interval`. Set `wait_for_refresh=false` only when asynchronous
+completion is intentional. Waiting requires Doris materialized-view task
+history to remain enabled so the adapter can identify the initial build task.
 
 The supported refresh triggers are `manual`, `schedule`, and `commit`.
 Production schedules accept `minute`, `hour`, `day`, or `week`. The adapter
@@ -96,13 +97,11 @@ Common asynchronous MV settings are:
 | Config | Purpose |
 | --- | --- |
 | `build_mode` | `immediate` (default) waits for the initial build; `deferred` creates without an initial refresh. |
-| `refresh_method` | Doris `auto` (default) or `complete` refresh method. |
-| `refresh_trigger` | `manual` (default), `schedule`, or `commit`. |
+| `refresh_method` | Doris `auto` (default) or `complete` method written into the MV DDL. |
+| `refresh_trigger` | `manual` (default), `schedule`, or `commit`, written into the MV DDL. |
 | `refresh_schedule` | Schedule mapping with `interval`, `unit`, and optional `start_time`. |
-| `refresh_on_run` | Submit an explicit refresh for an unchanged MV during every dbt run; defaults to `false`. |
-| `refresh_partitions` | One partition name or a list for `refresh_on_run=true`; requires a partitioned MV. |
-| `wait_for_refresh` | Wait for an adapter-submitted refresh to finish; defaults to `true`. |
-| `refresh_wait_timeout` / `refresh_poll_interval` | Refresh-task timeout and polling interval in seconds. |
+| `wait_for_refresh` | Wait for the `BUILD IMMEDIATE` initial build task; defaults to `true`. |
+| `refresh_wait_timeout` / `refresh_poll_interval` | Initial-build task timeout and polling interval in seconds. |
 | `duplicate_key` | One key column or a list of key columns for `DUPLICATE KEY`. |
 | `partition_by` | One partition identifier or Doris-supported function call, supplied as a string or single-item list. |
 | `distribution_type` | `hash` or `random`; inferred from whether `distributed_by` is set. |
@@ -111,20 +110,24 @@ Common asynchronous MV settings are:
 | `properties` | Additional Doris MV properties as a dictionary. |
 | `on_configuration_change` | `apply` (atomic replacement), `continue`, or `fail`. |
 
-Unlike dbt Core's default materialized-view workflow, dbt-doris skips refresh
-when an asynchronous MV definition is unchanged. This lets Doris schedule or
-commit triggers own refresh timing. Set `refresh_on_run=true` to opt into a
-refresh on every dbt run. When waiting is enabled, the adapter polls Doris
-`tasks('type'='mv')`; the dbt adapter response includes the successful refresh
-task ID, status, and last query ID when Doris provides one. Failed, canceled,
-unexpected, or timed-out tasks fail the model instead of being reported as a
-successful run.
+dbt-doris treats a materialized-view model run as definition and configuration
+deployment. It manages `CREATE`, atomic replacement, `DROP`, and the refresh
+policy in the MV DDL. When the deployed definition is unchanged, the run skips
+the MV and does not submit `REFRESH MATERIALIZED VIEW`. Doris owns all
+subsequent refresh timing, execution, and partition selection according to that
+DDL.
+
+When waiting for a `BUILD IMMEDIATE` initial build, the adapter polls Doris
+`tasks('type'='mv')`; the dbt adapter response includes the successful task ID,
+status, and last query ID when Doris provides one. A failed, canceled,
+unexpected, or timed-out initial build fails the model instead of being
+reported as a successful deployment.
 
 Outside-transaction pre-hooks run before deployed-definition inspection.
 Definition changes are built as a temporary MV and exposed through Doris's
 atomic materialized-view replacement; with `BUILD IMMEDIATE`, exposure happens
-only after the refresh succeeds, while `BUILD DEFERRED` intentionally has no
-initial refresh to wait for. The deployment marker is finalized after
+only after the initial build succeeds, while `BUILD DEFERRED` intentionally has
+no initial build task to wait for. The deployment marker is finalized after
 inside-transaction post-hooks, allowing a later run to detect and recover an
 interrupted deployment. If an atomic replacement succeeded but an inside
 post-hook failed, the previous MV remains under the temporary name; the next
