@@ -130,8 +130,8 @@ dbt-doris 负责：
 - 生成 Doris Async MV SQL；
 - 从 Doris 元数据中识别已有对象；
 - 把 dbt 的创建、替换和删除动作以及刷新策略映射到 Doris DDL；
-- 定义未变化且触发方式为 `ON MANUAL` 时提交 Doris Refresh，并按配置等待
-  本次 Task。
+- 定义未变化且触发方式为 `ON MANUAL` 时，每次选中该 Model 的运行都提交
+  Doris Refresh，并默认等待本次 Task。
 
 Doris 负责：
 
@@ -312,14 +312,15 @@ REPLACE WITH MATERIALIZED VIEW ...
 - 第二次运行不会因对象已存在而失败；
 - 不会把已有 Async MV 当作 Table 删除；
 - 不会在每次运行中无条件 Drop/Create；
-- 定义未变化且为 `ON MANUAL` 时提交一次
+- 定义未变化且为 `ON MANUAL` 时，每次选中运行都提交一次
   `REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`；
 - 定义未变化且为 `ON SCHEDULE/COMMIT` 时 Skip，把触发交给 Doris。
 
 dbt 官方把 Materialized View 的 `dbt run` 主要视为定义和配置的部署动作，
 而数据刷新通常由数据库管理。dbt-doris 针对 Doris Trigger 做明确分流：
 `ON MANUAL` 把定义未变的 `dbt run` 作为刷新入口；`ON SCHEDULE/COMMIT`
-定义未变时 Skip，后续触发由 Doris 管理。Adapter 不提供指定分区刷新。
+定义未变时 Skip，后续触发由 Doris 管理。该分流只由 `refresh_trigger`
+决定，不提供 `refresh_on_run`。Adapter 不提供指定分区刷新。
 
 CREATE/Replace 新定义时，`BUILD IMMEDIATE` 自己产生首次构建 Task，Adapter
 默认等待它成功后再把新定义视为可用，不会紧接着额外提交 Refresh。
@@ -406,7 +407,7 @@ Materialization 至少应正确处理：
 - 最小可运行示例；
 - Manual、Schedule、Commit 三种刷新方式；
 - AUTO 与 COMPLETE 的区别；
-- `dbt run` 不触发部署后的刷新；
+- `ON MANUAL` 的定义未变运行会触发 Refresh；`ON SCHEDULE/COMMIT` 不会；
 - `--full-refresh` 与 `REFRESH ... COMPLETE` 的区别；
 - Config 列表和默认值；
 - Doris 与 dbt Core 的版本要求；
@@ -436,11 +437,12 @@ Jinja Macro 会归一化枚举值，校验不合法组合，并引用标识符�
 默认 `BUILD IMMEDIATE` 会等待 CREATE 新定义产生的 Doris 首次构建任务成功。
 CREATE/Replace 不额外提交 Refresh。定义未变化时，`ON MANUAL` 提交
 `REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`，`ON SCHEDULE/COMMIT` Skip。
+是否提交只由 `refresh_trigger` 决定，不提供 `refresh_on_run`。
 Adapter 从 `tasks('type'='mv')` 的 Task ID 差集选择并等待首次构建或 Manual
 Refresh 后出现的新 Task；失败、取消、未知状态或超时会使 Model 失败，成功
 Adapter Response 包含 Task ID、Status 和可用的 Last Query ID。关闭等待时只
-提交动作。当前没有 Query ID 强关联；同一 MV 的并发外部刷新可能被误认，等待
-超时也不会取消 Doris 中已经提交的异步 Task。
+停止轮询，不会跳过 Manual Refresh SQL。当前没有 Query ID 强关联；同一 MV
+的并发外部刷新可能被误认，等待超时也不会取消 Doris 中已经提交的异步 Task。
 
 ### 6.3 Docs、Grants 与 Hook
 
@@ -614,9 +616,10 @@ ON COMMIT
 | Async MV 识别 | 结合 `mv_infos` 补全 Relation Type |
 | SQL/Config 变化 | 临时 MV 构建成功后原子 Replace |
 | Create/Replace 完成语义 | Immediate 只等待 BUILD Task，不额外 Refresh；Deferred 只创建 |
-| Manual 完成语义 | 定义未变时提交 Refresh；默认等待新 Task，关闭等待时只提交 |
+| Manual 完成语义 | 定义未变时每次选中运行都提交 Refresh；默认等待新 Task，关闭等待时仍提交但不轮询 |
 | Deferred + Manual | 第一次只创建，第二次定义未变的 run 提交第一次 Refresh |
 | Schedule/Commit | 定义未变时 Skip，后续触发由 Doris 管理 |
+| Refresh 分流 | 只由 `refresh_trigger` 决定，不提供 `refresh_on_run` |
 | 分区选择 | 由 Doris 按 MV 定义和 Refresh Method 管理；Adapter 不指定分区 |
 | Docs | 支持 `persist_docs.relation` 与 `persist_docs.columns` |
 | Grants | 显式 User/Role Principal；Replace 或 Additive |

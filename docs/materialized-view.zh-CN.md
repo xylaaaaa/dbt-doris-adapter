@@ -67,8 +67,8 @@ select ...;
 正常创建和更新流程中，用户不需要手写 CREATE、Replace、生命周期 Drop、Task
 轮询或失败恢复 SQL。在 dbt Model 定义中，除查询外，只有 Hook 是用户可选的
 原始 SQL；刷新策略、Docs 和 Grants 都通过 Config 声明，由 Adapter 生成对应
-语句。`ON MANUAL` 的后续刷新由定义未变化时的下一次 `dbt run` 提交；用户仍可
-按需直接执行 Doris 原生 Refresh SQL。
+语句。`ON MANUAL` 的后续刷新由定义未变化时每次选中该 Model 的 `dbt run`
+提交；用户仍可按需直接执行 Doris 原生 Refresh SQL。
 
 运行 Model：
 
@@ -90,6 +90,10 @@ dbt run --select daily_sales
 | `manual` | 定义未变化的 `dbt run` 提交 Doris Refresh；也可直接执行原生 SQL | 由 dbt Job 或外部调度精确触发 |
 | `schedule` | Doris 内置 Schedule | 固定时间间隔刷新 |
 | `commit` | Doris 根据底表提交触发 | 希望底表变化后自动刷新，且满足 Doris `ON COMMIT` 约束 |
+
+刷新动作直接由 `refresh_trigger` 决定，不提供额外的 `refresh_on_run` 开关。
+对于已存在且定义未变化的 MV，`manual` 每次选中运行都提交 Refresh；
+`schedule` 和 `commit` 都 Skip，后续触发交给 Doris。
 
 默认是 `manual`，同时默认 `build_mode='immediate'`。使用这两个默认值时，第一
 次 `dbt run` 只创建并等待首次构建；第二次及以后定义未变化的 `dbt run` 会
@@ -212,7 +216,7 @@ Adapter 只生成 `REFRESH AUTO ON COMMIT`；是否以及何时产生刷新任�
 | `refresh_method` | `auto` | `auto`、`complete` | 刷新范围；同时用于 DDL 和 Adapter 提交的 Manual Refresh |
 | `refresh_trigger` | `manual` | `manual`、`schedule`、`commit` | 刷新触发方式；Manual 由定义未变的 dbt run 提交 |
 | `refresh_schedule` | 无 | `interval`、`unit`、可选 `start_time` | 仅用于 `schedule`；生产 Unit 为 minute/hour/day/week |
-| `wait_for_refresh` | `true` | Boolean | 是否等待首次构建或 Adapter 提交的 Manual Refresh Task |
+| `wait_for_refresh` | `true` | Boolean | 是否等待首次构建或 Adapter 提交的 Manual Refresh Task；不影响是否提交 Refresh |
 | `refresh_wait_timeout` | `300` | 正整数秒 | 等待本次 Refresh Task 的总超时 |
 | `refresh_poll_interval` | `1` | 正整数秒 | 查询本次 Task 状态的间隔，不能大于总超时 |
 | `duplicate_key` | 无 | 列名或列名列表 | 生成 `DUPLICATE KEY` |
@@ -532,6 +536,9 @@ Catalog、Database 或其他 Role 继承的权限。创建、替换、Manual Ref
 Create/Replace 完成后，只要已部署定义没有变化，之后每次选中该 Model 的
 `dbt run` 都会由 Adapter 提交一次 Doris
 `REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`。
+
+是否提交 Refresh 只由 `refresh_trigger` 决定，没有 `refresh_on_run`：
+`wait_for_refresh=false` 只关闭 Task 轮询，不会跳过 Manual Refresh SQL。
 
 | 内容 | 由谁负责 |
 | --- | --- |

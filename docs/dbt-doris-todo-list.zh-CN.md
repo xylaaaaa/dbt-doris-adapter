@@ -135,10 +135,12 @@ View，不作为 Incremental Strategy。
   `REPLACE WITH MATERIALIZED VIEW`；Pre/Post Hook 与未完成部署恢复已覆盖，
   包括 Replace 后 Post-hook 失败时先原子回滚旧 MV 再重试。
 - [x] 支持 `ON MANUAL` Refresh 并返回 Doris Task 状态。首次 Create/Replace
-  只按 `BUILD IMMEDIATE` 等首次 Task，不额外 Refresh；定义未变时 Manual
-  提交 `REFRESH MATERIALIZED VIEW ... AUTO/COMPLETE` 并默认等待，关闭等待时
-  只提交；Schedule/Commit 未变时 Skip。`BUILD DEFERRED + MANUAL` 第一次只
-  创建、第二次运行刷新。入口：`wait_for_refresh`、
+  只按 `BUILD IMMEDIATE` 等首次 Task，不额外 Refresh；定义未变时，每次选中
+  Manual Model 都提交 `REFRESH MATERIALIZED VIEW ... AUTO/COMPLETE` 并默认
+  等待，关闭等待时仍提交但不轮询；Schedule/Commit 未变时 Skip。
+  刷新分流只由 `refresh_trigger` 决定，不提供 `refresh_on_run`。
+  `BUILD DEFERRED + MANUAL` 第一次只创建、第二次运行刷新。入口：
+  `wait_for_refresh`、
   `refresh_wait_timeout`、`refresh_poll_interval`；不提供指定分区刷新。
 - [x] Functional Test 覆盖创建、查询、Manual Refresh、Schedule/Commit Skip、
   Deferred 第二次运行、Task 等待/只提交、配置变化和删除。入口：

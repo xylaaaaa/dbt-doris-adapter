@@ -84,16 +84,22 @@ an unfinished initial build. Create and replacement do not submit an additional
 `REFRESH MATERIALIZED VIEW`; they only wait for the task produced by
 `BUILD IMMEDIATE`.
 
-For an unchanged `ON MANUAL` MV, a later `dbt run` submits
+For an unchanged `ON MANUAL` MV, every later `dbt run` that selects the model
+submits
 `REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE` and waits for its new task by
 default. The wait defaults to 300 seconds with one-second polling and can be
 tuned with `refresh_wait_timeout` and `refresh_poll_interval`. Set
-`wait_for_refresh=false` to submit without polling. Waiting requires Doris
+`wait_for_refresh=false` to submit without polling; this setting never
+suppresses the refresh itself. Waiting requires Doris
 materialized-view task history to remain enabled. The adapter identifies a task
 by comparing task IDs before and after submission; concurrent refreshes of the
 same MV can therefore be mistaken for the task submitted by dbt.
 
 The supported refresh triggers are `manual`, `schedule`, and `commit`.
+Refresh submission is determined directly by `refresh_trigger`; there is no
+separate `refresh_on_run` switch. For an existing unchanged MV, `manual`
+submits a refresh on every selected run, while `schedule` and `commit` skip and
+leave subsequent refreshes to Doris.
 Production schedules accept `minute`, `hour`, `day`, or `week`. The adapter
 rejects `second` because Doris only enables second-level schedules through a
 test-only setting.
