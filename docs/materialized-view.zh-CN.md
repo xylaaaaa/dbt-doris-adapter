@@ -10,40 +10,6 @@ CREATE/REPLACE/DROP 和刷新策略 DDL；对于 `ON MANUAL`，定义未变化�
 本 Materialization **只管理 Doris 异步物化视图**。Doris Sync Materialized
 View（Rollup）具有不同的 DDL 和生命周期，不在本实现范围内。
 
-## 先看结论
-
-当前实现把 `dbt run` 定义为 **MV 定义和配置的部署动作，以及 ON MANUAL 的
-刷新入口**。
-
-这里的 `ON MANUAL` 不是“dbt 只把策略写进 DDL，之后完全不管刷新”：首次
-Create/Replace 完成后，只要已部署定义没有变化，之后每次选中该 Model 的
-`dbt run` 都会由 Adapter 提交一次 Doris
-`REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`。
-
-| 内容 | 由谁负责 |
-| --- | --- |
-| Model SQL、`ref()`、`source()`、Alias、Schema 和可选 Hook | 用户声明，dbt 编译 |
-| CREATE、Replace、类型切换及部署流程所需的 Drop/失败恢复 | dbt-doris Adapter |
-| `BUILD IMMEDIATE` 创建/替换的首次构建任务 | Doris 执行，Adapter 默认等待；不会额外提交 Refresh |
-| `AUTO/COMPLETE` | 刷新范围：Doris 自动选择范围或执行完整刷新 |
-| `MANUAL/SCHEDULE/COMMIT` | 刷新触发方式 |
-| 定义未变的 `ON MANUAL` | Adapter 提交 Refresh，默认等待新 Task |
-| 定义未变的 `ON SCHEDULE/COMMIT` | Adapter Skip，Doris 按 DDL 触发 |
-
-因此：
-
-- 首次运行会创建 MV；默认 `BUILD IMMEDIATE`，Adapter 等待首次构建成功。
-- 首次创建或替换只等待 `BUILD IMMEDIATE` 自己产生的 Task，不会紧接着再提交
-  一次 `REFRESH MATERIALIZED VIEW`。
-- 定义未变化时，`ON MANUAL` 的后续 `dbt run` 提交
-  `REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`；默认等待本次新 Task。
-- 定义未变化时，`ON SCHEDULE` 和 `ON COMMIT` Skip，把后续触发交给 Doris。
-- `BUILD DEFERRED + ON MANUAL` 第一次运行只创建；第二次定义未变的运行提交
-  第一次 Refresh。
-- SQL 或配置变化时按 `on_configuration_change` 处理；目标已经是 MV、使用默认
-  `apply` 且保持默认等待时，Adapter 构建临时 MV，首次构建成功后原子替换。
-- 当前不提供指定分区刷新或内置刷新 `run-operation`。
-
 ## 版本范围
 
 | Doris 版本 | 当前运行时 Gate |
@@ -555,3 +521,37 @@ Catalog、Database 或其他 Role 继承的权限。创建、替换、Manual Ref
   Adapter 不模拟 Commit 调度。
 - 不要手动删除或修改 MV Comment 中的 `dbt-doris:` 部署标记；Marker 缺失或
   被修改会被识别为定义变化，并可能在默认 `apply` 策略下触发重建。
+
+## 结论
+
+当前实现把 `dbt run` 定义为 **MV 定义和配置的部署动作，以及 ON MANUAL 的
+刷新入口**。
+
+这里的 `ON MANUAL` 不是“dbt 只把策略写进 DDL，之后完全不管刷新”：首次
+Create/Replace 完成后，只要已部署定义没有变化，之后每次选中该 Model 的
+`dbt run` 都会由 Adapter 提交一次 Doris
+`REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`。
+
+| 内容 | 由谁负责 |
+| --- | --- |
+| Model SQL、`ref()`、`source()`、Alias、Schema 和可选 Hook | 用户声明，dbt 编译 |
+| CREATE、Replace、类型切换及部署流程所需的 Drop/失败恢复 | dbt-doris Adapter |
+| `BUILD IMMEDIATE` 创建/替换的首次构建任务 | Doris 执行，Adapter 默认等待；不会额外提交 Refresh |
+| `AUTO/COMPLETE` | 刷新范围：Doris 自动选择范围或执行完整刷新 |
+| `MANUAL/SCHEDULE/COMMIT` | 刷新触发方式 |
+| 定义未变的 `ON MANUAL` | Adapter 提交 Refresh，默认等待新 Task |
+| 定义未变的 `ON SCHEDULE/COMMIT` | Adapter Skip，Doris 按 DDL 触发 |
+
+因此：
+
+- 首次运行会创建 MV；默认 `BUILD IMMEDIATE`，Adapter 等待首次构建成功。
+- 首次创建或替换只等待 `BUILD IMMEDIATE` 自己产生的 Task，不会紧接着再提交
+  一次 `REFRESH MATERIALIZED VIEW`。
+- 定义未变化时，`ON MANUAL` 的后续 `dbt run` 提交
+  `REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`；默认等待本次新 Task。
+- 定义未变化时，`ON SCHEDULE` 和 `ON COMMIT` Skip，把后续触发交给 Doris。
+- `BUILD DEFERRED + ON MANUAL` 第一次运行只创建；第二次定义未变的运行提交
+  第一次 Refresh。
+- SQL 或配置变化时按 `on_configuration_change` 处理；目标已经是 MV、使用默认
+  `apply` 且保持默认等待时，Adapter 构建临时 MV，首次构建成功后原子替换。
+- 当前不提供指定分区刷新或内置刷新 `run-operation`。
