@@ -1860,7 +1860,9 @@ def test_adapter_maps_async_materialized_views_to_the_dbt_relation_type():
         "doris-4.1.2-rc01-build",
     ],
 )
-def test_materialized_view_version_contract_accepts_supported_releases(version):
+def test_materialized_view_version_contract_accepts_configured_gate_versions(
+    version,
+):
     table = agate.Table(
         [(version, "Yes")],
         ["Version", "CurrentConnected"],
@@ -1876,7 +1878,7 @@ def test_materialized_view_version_contract_accepts_supported_releases(version):
         "doris-3.0.0-release",
     ],
 )
-def test_materialized_view_version_contract_rejects_missing_atomic_replace(
+def test_materialized_view_version_contract_rejects_versions_outside_gate(
     version,
 ):
     table = agate.Table(
@@ -1884,7 +1886,10 @@ def test_materialized_view_version_contract_rejects_missing_atomic_replace(
         ["Version", "CurrentConnected"],
     )
 
-    with pytest.raises(dbt.exceptions.DbtRuntimeError, match="require.*3.0.1"):
+    with pytest.raises(
+        dbt.exceptions.DbtRuntimeError,
+        match="does not pass.*version gate",
+    ):
         _validate_doris_materialized_view_version(table)
 
 
@@ -1911,7 +1916,7 @@ def test_materialized_view_version_contract_also_validates_master_frontend():
 
     with pytest.raises(
         dbt.exceptions.DbtRuntimeError,
-        match="Required FE version: doris-3.0.0",
+        match="Doris FE version doris-3.0.0.*does not pass",
     ):
         _validate_doris_materialized_view_version(table)
 

@@ -154,10 +154,13 @@ View，不作为 Incremental Strategy。
   纳入定义 Hash。
 - Doris 专用 Grants 支持显式 `role:<name>`、
   `user:<name>@<host>` Principal，以及 `grants_mode=replace/additive`。
-- 当前运行时 Gate 接受 2.x 中不低于 2.1.5 的版本、除 3.0.0 外的 3.x，以及
-  主版本 4 及以上；版本 Gate 单测覆盖 2.1.5、2.1.10、3.0.1、3.1.0 和
-  4.1.2。运行时 `SHOW FRONTENDS` 优先校验当前连接 FE 和 Master FE，无法识别
-  角色时退回首行。
+- 真实 Doris 集群 Functional E2E 当前只覆盖
+  4.1.2-rc01（`doris-4.1.2-rc01-4536b29f712`）。当前运行时 Gate 接受
+  2.x 中不低于 2.1.5 的版本、除 3.0.0 外的 3.x，以及主版本 4 及以上；
+  模拟版本字符串的 Gate 单测覆盖 2.1.5、2.1.10、3.0.1、3.1.0 和 4.1.2，
+  但不验证 Doris 功能兼容性。除已实测版本外，投入生产前需要在对应版本上
+  运行 Functional Test。运行时 `SHOW FRONTENDS` 优先校验当前连接 FE 和
+  Master FE，无法识别角色时退回首行。
 - Sync Materialized View（Rollup）保持独立评估，本 TODO 不包含该能力。
 
 ## P1：完善 Incremental 高级能力

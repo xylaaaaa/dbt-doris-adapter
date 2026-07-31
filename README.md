@@ -7,13 +7,13 @@ This repository is derived from the
 component of Apache Doris. It is not an official Apache Software Foundation or
 dbt Labs release.
 
-## Compatibility
+## Compatibility and verification
 
-| Component | Supported baseline |
+| Component | Development or test baseline |
 | --- | --- |
 | dbt Core | 1.12.x |
-| Apache Doris runtime gate | 2.x at 2.1.5 or newer; 3.x except 3.0.0; major version 4 or newer |
-| Doris Async MV version-gate unit tests | 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 |
+| Doris Async MV live-cluster E2E | 4.1.2-rc01 (`doris-4.1.2-rc01-4536b29f712`) |
+| Doris Async MV gate unit tests | Mocked version strings for 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 |
 | Python | 3.10 or newer |
 | Database protocol | Doris MySQL protocol |
 
@@ -174,21 +174,25 @@ identities must use
 Role. Managing grants requires an execution identity that can read `SHOW ROLES`
 and administer privileges on the target relation.
 
-Asynchronous-MV compatibility is:
+Asynchronous-MV version evidence is:
 
-| Doris release | Current runtime gate |
-| --- | --- |
-| 2.x | Version 2.1.5 or newer |
-| 3.x | Every version except 3.0.0 |
-| 4 and newer major versions | Accepted by the current gate |
+| Check | Coverage | What it proves |
+| --- | --- | --- |
+| Functional E2E against a live Doris cluster | 4.1.2-rc01 (`doris-4.1.2-rc01-4536b29f712`) | The implemented lifecycle works on this tested cluster |
+| Unit tests with mocked `SHOW FRONTENDS` rows | 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 | Version parsing and gate decisions only; no Doris feature compatibility |
 
 Before managing an asynchronous MV, the adapter prefers the connected and
 Master FE versions from `SHOW FRONTENDS`; if neither role can be identified, it
 validates the first returned row. An unparsable or unsupported selected FE is
-rejected. Doris 3.0.0 is excluded because it does not provide the atomic
-materialized-view replacement semantics used by this lifecycle. Acceptance by
-the runtime gate is not a compatibility guarantee for an untested future Doris
-release.
+rejected. The current code gate accepts 2.x versions at 2.1.5 or newer, every
+3.x version except 3.0.0, and major version 4 or newer.
+
+Those boundaries are hard-coded runtime conditions, not results from a
+multi-version E2E matrix. In particular, this repository has not established
+through live-cluster testing that 2.1.5 is the exact minimum or that 3.0.0 is
+incompatible. Gate acceptance is therefore not a compatibility guarantee.
+Before production use on a Doris release other than the live-tested version,
+run the functional suite against that release.
 
 Only Doris asynchronous materialized views are managed. Synchronous
 materialized views (rollups) have a different lifecycle and remain explicitly

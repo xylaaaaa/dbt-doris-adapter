@@ -251,8 +251,8 @@ Config 设计必须满足：
 4. 不直接把未经校验的任意片段拼进 SQL；
 5. 文档明确各配置要求的 Doris 最低版本。
 
-例如，`ON COMMIT` 从 Doris 2.1.4 开始提供；使用该配置时不能只验证
-dbt-doris 版本，还要验证或声明 Doris 版本边界。
+例如，`ON COMMIT` 若存在 Doris 版本边界，必须结合对应 Release 的官方文档
+和真实集群测试确认，不能从 Adapter Gate 或模拟版本字符串单测推导最低版本。
 
 ## 5. 功能需求
 
@@ -458,19 +458,21 @@ Outside Pre-hook 在 `SHOW CREATE` 和配置漂移检查前执行；Inside Hook 
 部署动作。Inside Post-hook 成功后才把部署标记从 Pending 改为 Complete；
 Replace 后 Post-hook 失败时保留旧 MV，并在下次运行先原子回滚再重试。
 
-### 6.4 版本矩阵
+### 6.4 版本 Gate 与验证状态
 
-| Doris 版本 | 当前运行时 Gate |
-| --- | --- |
-| 2.x | 版本号不低于 2.1.5 |
-| 3.x | 除 3.0.0 外均通过 Gate |
-| 4 及更高主版本 | 当前 Gate 接受 |
+| 验证层级 | 覆盖范围 | 能说明什么 |
+| --- | --- | --- |
+| 真实 Doris 集群 Functional E2E | 4.1.2-rc01（`doris-4.1.2-rc01-4536b29f712`） | 当前 MV 生命周期在该测试集群通过 |
+| 模拟 `SHOW FRONTENDS` 返回值的 Gate 单测 | 2.1.5、2.1.10、3.0.1、3.1.0 和 4.1.2 | 只验证版本解析和 Gate 判断，不验证 Doris 功能兼容性 |
 
 Adapter 通过 `SHOW FRONTENDS` 优先校验当前连接 FE 和 Master FE；无法识别
-角色时退回首行，被选中行无法解析或未通过 Gate 时失败。3.0.0 缺少本生命周期
-依赖的原子 MV Replace 语义。通过 Gate 不代表尚未测试的未来版本已有兼容性
-保证。生产 Schedule Unit 为 minute/hour/day/week；测试专用的 second 会被
-Adapter 拒绝。
+角色时退回首行，被选中行无法解析或未通过 Gate 时失败。当前代码 Gate 接受
+2.x 中不低于 2.1.5 的版本、除 3.0.0 外的 3.x，以及主版本 4 及以上。
+
+这些边界是人为设置的运行条件，不是多版本 E2E 结论；当前真实集群 E2E
+没有证明 2.1.5 是准确最低版本，也没有证明 3.0.0 一定不兼容。除上述已实测
+版本外，投入生产前需要在对应版本上执行 Functional Test。生产 Schedule Unit
+为 minute/hour/day/week；测试专用的 second 会被 Adapter 拒绝。
 
 ## 7. 交付范围结论
 
@@ -618,7 +620,8 @@ ON COMMIT
 | 分区选择 | 由 Doris 按 MV 定义和 Refresh Method 管理；Adapter 不指定分区 |
 | Docs | 支持 `persist_docs.relation` 与 `persist_docs.columns` |
 | Grants | 显式 User/Role Principal；Replace 或 Additive |
-| Doris 版本 Gate | 2.x >= 2.1.5、3.x 排除 3.0.0、主版本 >= 4；未来版本仍需实测 |
+| Doris 版本验证 | 真实集群 E2E 仅覆盖 4.1.2-rc01 |
+| Doris 版本 Gate | 当前代码接受 2.x >= 2.1.5、3.x 排除 3.0.0、主版本 >= 4；这是运行条件，不是兼容性矩阵 |
 
 ## 10. 实现拆分结果
 

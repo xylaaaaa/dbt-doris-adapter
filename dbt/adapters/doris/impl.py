@@ -304,11 +304,11 @@ def _validate_doris_materialized_view_version(
         )
         if not supported:
             raise dbt.exceptions.DbtRuntimeError(
-                "Doris asynchronous materialized views require Doris 2.1.5+ "
-                "within the 2.1 release line, Doris 3.0.1+, Doris 3.1+, or "
-                f"Doris 4.x+. Required FE version: {version_text}. Doris "
-                "3.0.0 is unsupported because it lacks atomic "
-                "materialized-view replacement."
+                f"Doris FE version {version_text} does not pass the adapter's "
+                "current asynchronous-materialized-view version gate. The "
+                "gate accepts Doris 2.x >= 2.1.5, Doris 3.x except 3.0.0, or "
+                "Doris major version >= 4. These gate boundaries are runtime "
+                "conditions, not a live-cluster compatibility matrix."
             )
 
 
