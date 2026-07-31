@@ -1,11 +1,10 @@
 # dbt-doris 异步物化视图：当前实现与使用指南
 
 dbt Model 配置 `materialized='materialized_view'` 后，dbt-doris 会把编译后的
-Model 查询创建为 Doris Async Materialized View。`ref()`、`source()`、Alias、
-目标 Schema、Hook、血缘、测试和文档仍由 dbt 管理。dbt-doris 部署
-CREATE/REPLACE/DROP 和刷新策略 DDL；对于 `ON MANUAL`，定义未变化的后续
-`dbt run` 还会提交一次 Doris Refresh。`ON SCHEDULE` 和 `ON COMMIT` 的后续
-触发仍由 Doris 管理。
+Model 查询创建为 Doris Async Materialized View，并管理
+CREATE/REPLACE/DROP、刷新策略和失败恢复。对于 `ON MANUAL`，定义未变化的
+后续 `dbt run` 会提交 Doris Refresh；`ON SCHEDULE` 和 `ON COMMIT` 的后续
+触发由 Doris 管理。
 
 本 Materialization **只管理 Doris 异步物化视图**。Doris Sync Materialized
 View（Rollup）具有不同的 DDL 和生命周期，不在本实现范围内。
@@ -34,7 +33,7 @@ dbt Core 的开发与测试基线是 1.12.x。每次管理 Async MV 前，Adapte
 ## 完整示例
 
 下面以按日期汇总订单销售额的 `ON MANUAL` 异步物化视图为例。假设项目中已经
-存在 `orders` Model，目标 Schema 为 `analytics`：
+存在 `orders` Model：
 
 ```sql
 -- models/daily_sales.sql
@@ -56,15 +55,12 @@ from {{ ref('orders') }}
 group by order_date
 ```
 
-这个示例只声明本 Materialization 的创建、刷新、Task 等待和配置变化策略。
-Key、Partition、Distribution、Bucket 和 Properties 属于 Doris 对象的物理
-设计，不放进本功能的使用示例。
+这个示例声明了本 Materialization 的创建、刷新、Task 等待和配置变化策略。
 
 正常创建和更新流程中，用户不需要手写 CREATE、Replace、生命周期 Drop、Task
-轮询或失败恢复 SQL。在 dbt Model 定义中，除查询外，只有 Hook 是用户可选的
-原始 SQL；刷新策略、Docs 和 Grants 都通过 Config 声明，由 Adapter 生成对应
-语句。`ON MANUAL` 的后续刷新由定义未变化时每次选中该 Model 的 `dbt run`
-提交；用户仍可按需直接执行 Doris 原生 Refresh SQL。
+轮询或失败恢复 SQL。Adapter 根据 Config 生成对应语句。`ON MANUAL` 的后续
+刷新由定义未变化时每次选中该 Model 的 `dbt run` 提交；用户仍可按需直接执行
+Doris 原生 Refresh SQL。
 
 运行 Model：
 
@@ -277,24 +273,22 @@ Refresh 的等待。等待依赖 Doris 保留 MV Task History；若任务历史�
 | --- | --- |
 | 目标不存在 | 创建异步物化视图；Immediate 只等待 BUILD Task，Deferred 只创建 |
 | 定义未变化 + `ON MANUAL` | 提交 `REFRESH MATERIALIZED VIEW ... AUTO/COMPLETE`；默认等待新 Task |
-| 定义未变化 + `ON SCHEDULE/COMMIT` | Skip，不提交 Refresh；版本检查、Outside Hook 和可选 Grants 仍执行 |
-| Model SQL、Persisted Docs 或 MV DDL Config 变化 | 按 `on_configuration_change` 处理 |
+| 定义未变化 + `ON SCHEDULE/COMMIT` | Skip，不提交 Refresh，后续触发由 Doris 管理 |
+| Model SQL 或生命周期与刷新配置变化 | 按 `on_configuration_change` 处理 |
 | `on_configuration_change='apply'` | 构建临时 MV；Immediate 默认等首次构建成功后原子 Replace，关闭等待时提前暴露，Deferred 不产生首次任务 |
-| `on_configuration_change='continue'` | 保留 Doris 中的旧定义并给出警告；不提交 Manual Refresh、不执行 Inside Hook，但仍处理 Outside Hook 和 Grants |
+| `on_configuration_change='continue'` | 保留 Doris 中的旧定义并给出警告，不提交 Manual Refresh |
 | `on_configuration_change='fail'` | 终止运行，不修改已有对象 |
 | 使用 `--full-refresh` | 即使定义未变也重新部署完整定义；只处理 BUILD，不额外提交 Manual Refresh |
 | Table、View 与 MV 互相切换 | 交给目标 Materialization 按真实 Relation Type 处理；各方向的安全边界见下文 |
 
 ### MV → MV 原子替换与失败恢复
 
-dbt-doris 在 MV Comment 中保存部署状态和定义 Hash。Hash 会归一化受支持的
-枚举值、部分等价的字符串/列表配置、Buckets 和 Property 顺序；编译 SQL 的
-大小写或内部空白变化仍可能改变 Hash，并触发重建。部署先写
-`deployment-pending`，Inside Post-hook 成功后才改成
-`definition-hash`；如果进程在中途失败，下次运行会识别未完成部署并安全恢复。
-如果原子 Replace 已完成但 Inside Post-hook 失败，旧 MV 会保留在临时名称下；
-下一次运行先把旧 MV 原子换回线上目标，再重试新定义，避免过早删除最后一个完整
-版本。
+dbt-doris 在 MV Comment 中保存部署状态和定义 Hash。Hash 根据编译 SQL 和参与
+MV 定义的配置生成；SQL 大小写或内部空白变化仍可能改变 Hash，并触发重建。
+部署开始时写入 `deployment-pending`，完整流程成功后改为
+`definition-hash`。如果进程在中途失败，下次运行会识别未完成部署并恢复。
+如果原子 Replace 已完成但流程中断，旧 MV 会保留在临时名称下；下一次运行先把
+旧 MV 原子换回线上目标，再重试新定义，避免过早删除最后一个完整版本。
 
 已有 MV 的结构变化不会先删除线上对象。Adapter 先创建临时 MV；Immediate 在
 默认 `wait_for_refresh=true` 时等待新定义的首次构建成功，再用 Doris 原子
@@ -305,47 +299,18 @@ Swap 暴露新定义；Deferred 按其语义不发起首次构建。
 
 - 首次创建失败时没有旧版本可恢复，但失败的临时对象不会被当成成功目标。
 - MV → MV 的临时 CREATE 或首次任务失败时，现有线上 MV 不变。
-- 原子 Swap 后 Inside Post-hook 失败时，下次运行先恢复旧 MV，再重试新定义。
-- Outside Post-hook 在 Complete Marker 写入后执行；它失败时不会自动回滚已经
-  部署的 MV。
-- Hook 副作用和 Doris Grants/DCL 是非事务性的，不随 MV Swap 一起回滚。
+- 原子 Swap 后流程中断时，下次运行先恢复旧 MV，再重试新定义。
 
 `--full-refresh` 是重新部署 MV 定义，不等于只执行
 `REFRESH MATERIALIZED VIEW ... COMPLETE`。它不会把 `refresh_method` 改成
 `complete`，也不会覆盖 `build_mode`；配置为 `BUILD DEFERRED` 时仍不会发起或
 等待首次构建。
 
-## Alias、自定义 Schema 和类型切换
-
-`alias` 修改 Doris 中的最终对象名，`schema` 选择 dbt Schema；在 Doris Adapter
-中，Schema 对应 Doris Database：
-
-```sql
--- 文件名仍然是 models/daily_sales.sql
-{{ config(
-    materialized='materialized_view',
-    alias='mv_daily_sales',
-    schema='reporting'
-) }}
-
-select ...
-```
-
-其他 Model 仍使用逻辑 Model 名：
-
-```sql
-select * from {{ ref('daily_sales') }}
-```
-
-dbt 会把它解析到真实对象 `mv_daily_sales`。使用 dbt 默认
-`generate_schema_name` 时，自定义 Schema 通常会与 Profile 的 Target Schema
-拼接，例如 `dbt_dev_reporting`；项目重写该 Macro 后也可以生成
-`reporting`。
+## Relation 类型切换
 
 同一个 Model 可以直接修改 `materialized`：
 
 ```text
-table ↔ view
 table ↔ materialized_view
 view  ↔ materialized_view
 ```
@@ -364,119 +329,10 @@ view  ↔ materialized_view
 - MV → MV 定义变化：使用 Doris `REPLACE WITH MATERIALIZED VIEW` 原子 Swap，
   这是当前失败恢复保护最完整的路径。
 
-修改 `alias`、`schema` 或删除 Model 时，dbt 不会自动删除原名称或原 Schema
-中的孤立对象；需要用户确认并单独清理。
-
 如果目标位置已经存在一个不是由本 Adapter 部署的 Async MV，因为没有
 `dbt-doris` Definition Marker，第一次运行会把它视为定义变化。默认
 `on_configuration_change='apply'` 会重建；设置 `continue` 会保留并警告，
 设置 `fail` 会拒绝接管。
-
-## Hook
-
-Hook 是可选的用户 SQL，用于在 Model 部署动作前后执行额外操作。下面假设
-`deployment_audit` 已经存在：
-
-```sql
-{{ config(
-    materialized='materialized_view',
-    pre_hook="set query_timeout = 300",
-    post_hook="insert into deployment_audit values ('daily_sales', current_timestamp())"
-) }}
-
-select ...
-```
-
-- Pre-hook 可用于设置当前 dbt Connection 的 Session 参数或准备辅助对象。
-- Post-hook 可用于写部署审计、更新辅助元数据或执行项目自定义维护 SQL。
-- Hook 在 `dbt run` 的部署流程中运行；不会在用户查询 MV 或 Doris 自动刷新时
-  运行，因此不能把它当作刷新调度器。
-- 普通字符串 Hook 默认是 Inside Hook，只在实际创建、替换、类型切换或 Manual
-  Refresh 时执行；Schedule/Commit 的 Skip 和配置变化的 Continue 不执行
-  Inside Hook。
-- 使用 `before_begin`、`after_commit` 等方式配置的 Outside Hook 在每次 Model
-  Run 都会执行，包括 Skip 和 Continue。Outside Pre-hook 在
-  `SHOW CREATE MATERIALIZED VIEW` 和定义漂移检查前执行；Outside Post-hook
-  在部署结果记录和临时对象清理后执行，延迟保留的 Backup 可能在其后删除。
-- Hook 失败会让 Model 失败；Adapter 使用 Pending 标记和临时/备份 Relation
-  支持 MV → MV 路径的后续恢复。Hook 已经产生的副作用不是事务性操作，不会随
-  MV Swap 自动回滚。
-
-## Persist Docs
-
-Relation 和 Column Description 均可持久化：
-
-```yaml
-version: 2
-
-models:
-  - name: daily_sales
-    description: 每日销售汇总
-    config:
-      persist_docs:
-        relation: true
-        columns: true
-    columns:
-      - name: order_date
-        description: 订单日期
-      - name: sales
-        description: 销售额
-```
-
-- `persist_docs.relation=true` 时，Relation Description 与 Adapter 部署标记一起
-  写入 MV Comment；关闭时只保留部署标记。
-- `persist_docs.columns=true` 时，Adapter 先读取 Model 查询的输出 Schema，再在
-  `CREATE MATERIALIZED VIEW (...)` 的完整列定义中写入匹配的 Column Comment。
-- 开启相应 Persist Docs 后，Description 变化会进入定义 Hash，并按配置变化策略
-  重新部署；未开启的 Description 变化不会触发重建。
-- YAML 中有说明但 Model 查询不存在的列会发出明确 Warning，避免静默漏写文档。
-
-## Grants
-
-Doris 的 User Identity 带 Host，而且 User 与 Role 可能同名，因此 Principal 必须
-显式写类型：
-
-```yaml
-models:
-  your_project:
-    daily_sales:
-      +grants:
-        select:
-          - "role:analyst"
-          - "user:reporter@%"
-          - "user:domain_reader@[example.com]"
-      +grants_mode: replace
-```
-
-| Principal | 含义 |
-| --- | --- |
-| `role:<name>` | Doris Role |
-| `user:<name>@<host>` | Doris User Identity |
-| `user:<name>@[<domain>]` | Doris Domain User Identity |
-
-裸名字不会被猜测成 User 或 Role。MV/View 支持 Relation 级 `select`
-（Doris `SELECT_PRIV`）；`insert` 只适用于 Table，并映射为 Doris
-`LOAD_PRIV`。Adapter 只管理已有 Principal 的 Relation 权限，不创建 Doris
-User 或 Role。
-
-- `grants_mode='replace'`：比较该 Relation 上的直接授权，补齐缺少的授权后再
-  回收配置中已删除的授权。
-- `grants_mode='additive'`：只增加配置中的授权，不回收已有授权。
-
-Replace 只管理目标 Relation 的直接 Table Privileges，不撤销从 Global、
-Catalog、Database 或其他 Role 继承的权限。创建、替换、Manual Refresh、Skip
-和 `on_configuration_change='continue'` 路径都会应用 Grants，因此项目级
-`+grants` 不会让 MV 编译失败，也不会在重复运行时被忽略。
-
-所有模式都会先用 `SHOW ROLES` 批量验证配置中的 User/Role；MV 在任何创建或
-替换 DDL 前完成该预检。不存在的 Principal 会让 Model 失败，且不会暴露
-新的 MV 定义或执行部分授权。Doris User 名按大小写精确匹配，Role 和 Host
-按 Doris 的大小写规则比较。
-
-执行 dbt 的 Doris 身份必须能执行 `SHOW FRONTENDS`，并具有查询、创建、删除、
-修改 MV 和管理目标授权所需的权限。配置 Grants 时还需读取 `SHOW ROLES`
-（Doris 要求执行身份具备全局 `GRANT_PRIV`）；若执行身份没有该权限，请不要在
-该 Model 上配置由 Adapter 管理的 Grants。
 
 ## 当前范围边界
 
@@ -496,16 +352,16 @@ Catalog、Database 或其他 Role 继承的权限。创建、替换、Manual Ref
 
 当前分支已经通过：
 
-- 233 个 Unit Test；
-- 65 个 Doris Functional E2E Test；
+- Async MV 配置、DDL、刷新分流、Task 等待和失败恢复 Unit Test；
+- 创建、Manual Refresh、Schedule/Commit Skip 和配置变化 Doris Functional
+  E2E Test；
 - dbt 官方 Materialized View 基础生命周期 Contract Test；
-- Table、View、Materialized View 双向切换及
-  `Table → Materialized View → View → Table` 连续切换；
-- Python 3.10、Python 3.14 和 Distribution Build GitHub CI；
-- Wheel、sdist 和 Twine Metadata 检查。
+- `Table ↔ Materialized View` 和 `View ↔ Materialized View` 类型切换测试。
 
 ## 排错
 
+- 执行 dbt 的 Doris 身份需要读取 `SHOW FRONTENDS`，并具备查询、创建、刷新、
+  修改和删除目标 Async MV 所需的权限。
 - 首次构建或 Manual Refresh 超时时先检查 `tasks('type'='mv')`、Task History
   保留设置和 Doris 返回的 ErrorMsg/LastQueryId。
 - `refresh_trigger='commit'` 仅在底表变更满足 Doris ON COMMIT 语义时触发，
@@ -528,7 +384,7 @@ Create/Replace 完成后，只要已部署定义没有变化，之后每次选�
 
 | 内容 | 由谁负责 |
 | --- | --- |
-| Model SQL、`ref()`、`source()`、Alias、Schema 和可选 Hook | 用户声明，dbt 编译 |
+| Model SQL、`ref()` 和 `source()` | 用户声明，dbt 编译 |
 | CREATE、Replace、类型切换及部署流程所需的 Drop/失败恢复 | dbt-doris Adapter |
 | `BUILD IMMEDIATE` 创建/替换的首次构建任务 | Doris 执行，Adapter 默认等待；不会额外提交 Refresh |
 | `AUTO/COMPLETE` | 刷新范围：Doris 自动选择范围或执行完整刷新 |
