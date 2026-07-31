@@ -31,14 +31,24 @@ dbt Core 的开发与测试基线是 1.12.x。每次管理 Async MV 前，Adapte
 生产定时任务支持 `minute`、`hour`、`day` 和 `week`。Adapter 会拒绝
 `second`，因为 Doris 只通过测试专用设置开启秒级 Schedule。
 
-## 用户最少需要写什么
+## 完整示例
 
-最小模型只需要 `materialized='materialized_view'` 和查询 SQL：
+下面以按日期汇总订单销售额的 `ON MANUAL` 异步物化视图为例。假设项目中已经
+存在 `orders` Model，目标 Schema 为 `analytics`：
 
 ```sql
 -- models/daily_sales.sql
 {{ config(
     materialized='materialized_view',
+    alias='daily_sales_mv',
+    build_mode='immediate',
+    refresh_method='auto',
+    refresh_trigger='manual',
+    duplicate_key=['order_date'],
+    partition_by='order_date',
+    distribution_type='hash',
+    distributed_by=['order_date'],
+    buckets=8,
     replication_num='1'
 ) }}
 
@@ -49,16 +59,22 @@ from {{ ref('orders') }}
 group by order_date
 ```
 
-未指定其他配置时，核心 DDL 相当于：
+Adapter 生成的核心 DDL 相当于：
 
 ```sql
-CREATE MATERIALIZED VIEW `analytics`.`daily_sales`
+CREATE MATERIALIZED VIEW `analytics`.`daily_sales_mv`
 BUILD IMMEDIATE
 REFRESH AUTO ON MANUAL
-DISTRIBUTED BY RANDOM BUCKETS AUTO
+DUPLICATE KEY (`order_date`)
+PARTITION BY (`order_date`)
+DISTRIBUTED BY HASH (`order_date`) BUCKETS 8
 PROPERTIES ("replication_num" = "1")
 AS
-select ...;
+select
+    order_date,
+    sum(amount) as sales
+from `analytics`.`orders`
+group by order_date;
 ```
 
 这里使用 `replication_num='1'` 方便单 BE 开发环境直接运行；生产环境应按 Doris
@@ -77,7 +93,8 @@ dbt run --select daily_sales
 ```
 
 首次 `dbt run` 创建定义并等待 `BUILD IMMEDIATE` 产生的首次任务成功，不额外
-提交 Refresh。以后定义未变化时不重复创建：默认 `ON MANUAL` 会提交一次
+提交 Refresh。以后定义未变化时不重复创建：显式配置的 `ON MANUAL` 每次都会
+提交一次
 `REFRESH MATERIALIZED VIEW ... AUTO` 并等待；`ON SCHEDULE` 或 `ON COMMIT`
 则 Skip，由 Doris 按 DDL 中的策略管理。
 
