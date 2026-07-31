@@ -68,8 +68,7 @@ To manage a Doris asynchronous materialized view, configure a model with
     build_mode='immediate',
     refresh_method='auto',
     refresh_trigger='manual',
-    wait_for_refresh=true,
-    replication_num='1'
+    wait_for_refresh=true
 ) }}
 
 select order_date, sum(amount) as sales
@@ -104,7 +103,7 @@ Production schedules accept `minute`, `hour`, `day`, or `week`. The adapter
 rejects `second` because Doris only enables second-level schedules through a
 test-only setting.
 
-Common asynchronous MV settings are:
+Common asynchronous MV lifecycle and refresh settings are:
 
 | Config | Purpose |
 | --- | --- |
@@ -114,12 +113,6 @@ Common asynchronous MV settings are:
 | `refresh_schedule` | Schedule mapping with `interval`, `unit`, and optional `start_time`. |
 | `wait_for_refresh` | Wait for an initial-build or adapter-submitted manual refresh task; defaults to `true`. |
 | `refresh_wait_timeout` / `refresh_poll_interval` | Refresh-task timeout and polling interval in seconds. |
-| `duplicate_key` | One key column or a list of key columns for `DUPLICATE KEY`. |
-| `partition_by` | One partition identifier or Doris-supported function call, supplied as a string or single-item list. |
-| `distribution_type` | `hash` or `random`; inferred from whether `distributed_by` is set. |
-| `distributed_by` / `buckets` | Doris distribution columns and bucket count. |
-| `replication_num` | Convenience setting merged into `properties`; it takes precedence over the same key in `properties`. |
-| `properties` | Additional Doris MV properties as a dictionary. |
 | `on_configuration_change` | `apply` (atomic replacement), `continue`, or `fail`. |
 
 dbt-doris manages both MV deployment and the `ON MANUAL` run action. If the

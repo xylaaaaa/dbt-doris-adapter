@@ -40,16 +40,13 @@ dbt Core 的开发与测试基线是 1.12.x。每次管理 Async MV 前，Adapte
 -- models/daily_sales.sql
 {{ config(
     materialized='materialized_view',
-    alias='daily_sales_mv',
     build_mode='immediate',
     refresh_method='auto',
     refresh_trigger='manual',
-    duplicate_key=['order_date'],
-    partition_by='order_date',
-    distribution_type='hash',
-    distributed_by=['order_date'],
-    buckets=8,
-    replication_num='1'
+    wait_for_refresh=true,
+    refresh_wait_timeout=300,
+    refresh_poll_interval=1,
+    on_configuration_change='apply'
 ) }}
 
 select
@@ -59,26 +56,9 @@ from {{ ref('orders') }}
 group by order_date
 ```
 
-Adapter 生成的核心 DDL 相当于：
-
-```sql
-CREATE MATERIALIZED VIEW `analytics`.`daily_sales_mv`
-BUILD IMMEDIATE
-REFRESH AUTO ON MANUAL
-DUPLICATE KEY (`order_date`)
-PARTITION BY (`order_date`)
-DISTRIBUTED BY HASH (`order_date`) BUCKETS 8
-PROPERTIES ("replication_num" = "1")
-AS
-select
-    order_date,
-    sum(amount) as sales
-from `analytics`.`orders`
-group by order_date;
-```
-
-这里使用 `replication_num='1'` 方便单 BE 开发环境直接运行；生产环境应按 Doris
-集群副本策略调整。
+这个示例只声明本 Materialization 的创建、刷新、Task 等待和配置变化策略。
+Key、Partition、Distribution、Bucket 和 Properties 属于 Doris 对象的物理
+设计，不放进本功能的使用示例。
 
 正常创建和更新流程中，用户不需要手写 CREATE、Replace、生命周期 Drop、Task
 轮询或失败恢复 SQL。在 dbt Model 定义中，除查询外，只有 Hook 是用户可选的
@@ -225,10 +205,11 @@ Adapter 只生成 `REFRESH AUTO ON COMMIT`；是否以及何时产生刷新任�
 `AUTO` 可能把 MV 视为已经同步，而不是可靠地退化为全量刷新；这类场景应使用
 `COMPLETE`。
 
-## 完整配置参考
+## 生命周期与刷新配置
 
 | Config | 默认值 | 支持值或格式 | 作用 |
 | --- | --- | --- | --- |
+| `materialized` | 无 | `materialized_view` | 使用 Doris Async MV Materialization |
 | `build_mode` | `immediate` | `immediate`、`deferred` | 创建后立即构建，或推迟到以后刷新 |
 | `refresh_method` | `auto` | `auto`、`complete` | 刷新范围；同时用于 DDL 和 Adapter 提交的 Manual Refresh |
 | `refresh_trigger` | `manual` | `manual`、`schedule`、`commit` | 刷新触发方式；Manual 由定义未变的 dbt run 提交 |
@@ -236,15 +217,7 @@ Adapter 只生成 `REFRESH AUTO ON COMMIT`；是否以及何时产生刷新任�
 | `wait_for_refresh` | `true` | Boolean | 是否等待首次构建或 Adapter 提交的 Manual Refresh Task；不影响是否提交 Refresh |
 | `refresh_wait_timeout` | `300` | 正整数秒 | 等待本次 Refresh Task 的总超时 |
 | `refresh_poll_interval` | `1` | 正整数秒 | 查询本次 Task 状态的间隔，不能大于总超时 |
-| `duplicate_key` | 无 | 列名或列名列表 | 生成 `DUPLICATE KEY` |
-| `partition_by` | 无 | 字符串或单元素列表 | 一个分区列或 Doris 支持的分区映射函数 |
-| `distribution_type` | 自动判断 | `hash`、`random` | 设置分布方式 |
-| `distributed_by` | 无 | 列名或列名列表 | Hash 分布列；配置后默认选择 Hash |
-| `buckets` | `auto` | 正整数、`auto` | Bucket 数量 |
-| `replication_num` | 无 | 正整数或数字字符串 | 合并进 Properties，并覆盖其中同名键 |
-| `properties` | `{}` | 标量值字典 | Doris Async MV Properties |
 | `on_configuration_change` | `apply` | `apply`、`continue`、`fail` | 已部署定义发生变化时的策略 |
-| `grants_mode` | `replace` | `replace`、`additive` | 收敛或只增加直接 Relation Grants |
 
 `refresh_schedule` 不能用于 `manual` 或 `commit`，`unit='second'` 会在执行
 DDL 前被拒绝。
@@ -533,10 +506,6 @@ Catalog、Database 或其他 Role 继承的权限。创建、替换、Manual Ref
 
 ## 排错
 
-- `partition_by` 只接受一个分区标识符或 Doris 支持的分区映射函数；多列或任意
-  SQL 片段会在 Adapter 校验阶段失败。
-- 单 BE 开发集群应设置 `replication_num=1`；顶层值优先于
-  `properties.replication_num`。
 - 首次构建或 Manual Refresh 超时时先检查 `tasks('type'='mv')`、Task History
   保留设置和 Doris 返回的 ErrorMsg/LastQueryId。
 - `refresh_trigger='commit'` 仅在底表变更满足 Doris ON COMMIT 语义时触发，
