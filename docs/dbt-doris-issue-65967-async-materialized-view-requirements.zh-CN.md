@@ -201,8 +201,9 @@ Adapter 默认等待它，但不额外提交 Refresh。第二次及以后定义�
 REFRESH MATERIALIZED VIEW `analytics`.`mv_daily_sales` AUTO;
 ```
 
-并默认等待本次新 Task。`AUTO` 来自 `refresh_method`，表示刷新范围；`MANUAL`
-表示由 dbt run 或其他外部操作触发。Adapter 不提供指定分区 Refresh。
+并默认等待提交后发现的新 Task。`AUTO` 来自 `refresh_method`，表示刷新范围；
+`MANUAL` 表示由 dbt run 或其他外部操作触发。Adapter 不提供指定分区 Refresh，
+也不区分同一 MV 上并发外部 Refresh 产生的新 Task。
 
 ### 3.2 定时刷新型异步物化视图
 
@@ -333,7 +334,7 @@ Manual Refresh 只提交 SQL。
 | 配置 | 期望行为 |
 | --- | --- |
 | `apply` | 能安全 ALTER 的配置直接修改；不能 ALTER 的变化安全重建 |
-| `continue` | 保留已有对象，给出警告并继续 |
+| `continue` | 保留已有对象，给出警告并继续；不提交 Manual Refresh |
 | `fail` | 检测到变化时明确失败，不修改已有对象 |
 
 建议的变化处理原则：
@@ -435,9 +436,11 @@ Jinja Macro 会归一化枚举值，校验不合法组合，并引用标识符�
 默认 `BUILD IMMEDIATE` 会等待 CREATE 新定义产生的 Doris 首次构建任务成功。
 CREATE/Replace 不额外提交 Refresh。定义未变化时，`ON MANUAL` 提交
 `REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`，`ON SCHEDULE/COMMIT` Skip。
-Adapter 从 `tasks('type'='mv')` 识别并等待首次构建或本次 Manual Refresh
-产生的新 Task；失败、取消、未知状态或超时会使 Model 失败，成功 Adapter
-Response 包含 Task ID、Status 和可用的 Last Query ID。关闭等待时只提交动作。
+Adapter 从 `tasks('type'='mv')` 的 Task ID 差集选择并等待首次构建或 Manual
+Refresh 后出现的新 Task；失败、取消、未知状态或超时会使 Model 失败，成功
+Adapter Response 包含 Task ID、Status 和可用的 Last Query ID。关闭等待时只
+提交动作。当前没有 Query ID 强关联；同一 MV 的并发外部刷新可能被误认，等待
+超时也不会取消 Doris 中已经提交的异步 Task。
 
 ### 6.3 Docs、Grants 与 Hook
 
@@ -457,17 +460,17 @@ Replace 后 Post-hook 失败时保留旧 MV，并在下次运行先原子回滚�
 
 ### 6.4 版本矩阵
 
-| Doris 版本线 | 支持范围 |
+| Doris 版本 | 当前运行时 Gate |
 | --- | --- |
-| 2.1 | 2.1.5 及之后的 2.1.x，包含 ON COMMIT |
-| 3.0 | 3.0.1 及之后；排除 3.0.0 |
-| 3.1 | 3.1.x |
-| 4.x | 4.x |
+| 2.x | 版本号不低于 2.1.5 |
+| 3.x | 除 3.0.0 外均通过 Gate |
+| 4 及更高主版本 | 当前 Gate 接受 |
 
-Adapter 通过 `SHOW FRONTENDS` 校验当前连接 FE 和 Master FE；任一关键 FE
-无法确定、无法解析或不在矩阵内时直接失败。3.0.0 缺少本生命周期依赖的原子
-MV Replace 语义。生产 Schedule Unit 为 minute/hour/day/week；测试专用的
-second 会被 Adapter 拒绝。
+Adapter 通过 `SHOW FRONTENDS` 优先校验当前连接 FE 和 Master FE；无法识别
+角色时退回首行，被选中行无法解析或未通过 Gate 时失败。3.0.0 缺少本生命周期
+依赖的原子 MV Replace 语义。通过 Gate 不代表尚未测试的未来版本已有兼容性
+保证。生产 Schedule Unit 为 minute/hour/day/week；测试专用的 second 会被
+Adapter 拒绝。
 
 ## 7. 交付范围结论
 
@@ -544,6 +547,7 @@ ON COMMIT
 - CREATE 和 `SHOW CREATE MATERIALIZED VIEW` 中的刷新策略正确；
 - 定义未变化的 Manual Run 分别生成
   `REFRESH MATERIALIZED VIEW ... AUTO/COMPLETE`；
+- 对 Doris 无法感知变化的外表不承诺 AUTO 自动退化全量，用户应选择 COMPLETE；
 - 非法值在执行前失败并指出具体 Config。
 
 ### AC5. 配置变化
@@ -614,7 +618,7 @@ ON COMMIT
 | 分区选择 | 由 Doris 按 MV 定义和 Refresh Method 管理；Adapter 不指定分区 |
 | Docs | 支持 `persist_docs.relation` 与 `persist_docs.columns` |
 | Grants | 显式 User/Role Principal；Replace 或 Additive |
-| 最低 Doris 版本 | 2.1.5+、3.0.1+、3.1.x、4.x，排除 3.0.0 |
+| Doris 版本 Gate | 2.x >= 2.1.5、3.x 排除 3.0.0、主版本 >= 4；未来版本仍需实测 |
 
 ## 10. 实现拆分结果
 

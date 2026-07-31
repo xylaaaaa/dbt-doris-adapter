@@ -15,6 +15,11 @@ View（Rollup）具有不同的 DDL 和生命周期，不在本实现范围内�
 当前实现把 `dbt run` 定义为 **MV 定义和配置的部署动作，以及 ON MANUAL 的
 刷新入口**。
 
+这里的 `ON MANUAL` 不是“dbt 只把策略写进 DDL，之后完全不管刷新”：首次
+Create/Replace 完成后，只要已部署定义没有变化，之后每次选中该 Model 的
+`dbt run` 都会由 Adapter 提交一次 Doris
+`REFRESH MATERIALIZED VIEW ... AUTO|COMPLETE`。
+
 | 内容 | 由谁负责 |
 | --- | --- |
 | Model SQL、`ref()`、`source()`、Alias、Schema 和可选 Hook | 用户声明，dbt 编译 |
@@ -41,17 +46,20 @@ View（Rollup）具有不同的 DDL 和生命周期，不在本实现范围内�
 
 ## 版本范围
 
-| Doris 版本线 | Async MV 支持范围 |
+| Doris 版本 | 当前运行时 Gate |
 | --- | --- |
-| 2.1 | 2.1.5 及之后的 2.1.x，包含 `ON COMMIT` |
-| 3.0 | 3.0.1 及之后；明确排除 3.0.0 |
-| 3.1 | 3.1.x |
-| 4.x | 4.x |
+| 2.x | 版本号不低于 2.1.5；Gate 单测覆盖 2.1.5 和 2.1.10 |
+| 3.x | 除 3.0.0 外均通过 Gate；Gate 单测覆盖 3.0.1 和 3.1.0 |
+| 4 及更高主版本 | 当前 Gate 接受；Gate 单测覆盖 4.1.2 |
 
 dbt Core 的开发与测试基线是 1.12.x。每次管理 Async MV 前，Adapter 会从
-`SHOW FRONTENDS` 读取当前连接 FE 和 Master FE 的版本；任一关键 FE 无法确定、
-无法解析或不在矩阵内时直接失败。Doris 3.0.0 缺少本生命周期依赖的原子 MV
-Replace 语义，因此明确拒绝。
+`SHOW FRONTENDS` 优先读取当前连接 FE 和 Master FE 的版本；如果返回结果无法
+标出这两个角色，则退回校验第一行。被选中行的版本无法解析或未通过 Gate 时
+直接失败。Doris 3.0.0 缺少本生命周期依赖的原子 MV Replace 语义，因此明确
+拒绝。
+
+上表描述的是当前代码中的版本判断条件，不等于对尚未实际测试的未来 Doris
+版本作兼容性保证。
 
 生产定时任务支持 `minute`、`hour`、`day` 和 `week`。Adapter 会拒绝
 `second`，因为 Doris 只通过测试专用设置开启秒级 Schedule。
@@ -135,7 +143,7 @@ Model 配置：
 select ...
 ```
 
-第一次运行创建 MV。以后定义未变化时执行：
+第一次运行创建 MV。以后定义未变化时，每次执行：
 
 ```bash
 dbt run --select daily_sales
@@ -221,11 +229,13 @@ Adapter 只生成 `REFRESH AUTO ON COMMIT`；是否以及何时产生刷新任�
 
 | 配置 | 含义 |
 | --- | --- |
-| `auto` | Doris 尝试识别上次刷新后发生变化的分区，只刷新相关 MV 分区；无法判断或不支持增量时退化为完整刷新 |
+| `auto` | Doris 根据能够获取的底表快照和分区版本判断刷新范围；对于可跟踪的底表尽量只刷新变化分区 |
 | `complete` | 不检查分区是否已同步，强制刷新 MV 的全部分区 |
 
 `AUTO` 只表示“由 Doris 选择刷新范围”，不表示“自动触发刷新”。是否自动触发由
-`refresh_trigger` 决定。
+`refresh_trigger` 决定。对于 Doris 无法感知数据变化的外表（例如 JDBC），
+`AUTO` 可能把 MV 视为已经同步，而不是可靠地退化为全量刷新；这类场景应使用
+`COMPLETE`。
 
 ## 完整配置参考
 
@@ -279,15 +289,21 @@ Adapter 会等待两类由当前 Model Action 产生的 Task：
 为：
 
 1. 在提交 CREATE 或 Manual Refresh 前记录该 MV 已有 Task ID；
-2. 动作提交后轮询 `tasks('type'='mv')` 中本次新增的 Task；
+2. 动作提交后轮询 `tasks('type'='mv')`，选择排序后第一个不在旧 ID 集合中的
+   Task；
 3. `SUCCESS` 才完成动作，并在 dbt Adapter Response 中返回 Task ID、Status，
    以及 Doris 提供时的 Last Query ID；
 4. `FAILED`、`CANCELED`、未知状态或超时都会让 Model 失败，并携带任务错误。
 
+当前等待器没有把 Refresh 语句的 Query ID 与 Task 做强关联。同一 MV 在 dbt
+等待期间如果又被其他客户端并发刷新，Adapter 可能识别到另一项新 Task。因此
+同一个 MV 应避免并发提交 Manual Refresh。
+
 只有明确配置 `wait_for_refresh=false` 时才只提交、不等待。
 `refresh_wait_timeout` 和 `refresh_poll_interval` 同时控制首次构建与 Manual
 Refresh 的等待。等待依赖 Doris 保留 MV Task History；若任务历史被关闭或过早
-清理，Adapter 会超时并给出提示。
+清理，Adapter 会超时并给出提示。等待超时只会让 dbt Model 失败，不会取消已经
+提交到 Doris 的异步 Refresh Task。
 
 配置 `BUILD IMMEDIATE` 但设置 `wait_for_refresh=false` 时，Adapter 会在首次
 任务完成前暴露新定义。下游 Model 可能看到尚未完成构建的 MV，只应在明确接受
@@ -303,7 +319,7 @@ Refresh 的等待。等待依赖 Doris 保留 MV Task History；若任务历史�
 | 定义未变化 + `ON SCHEDULE/COMMIT` | Skip，不提交 Refresh；版本检查、Outside Hook 和可选 Grants 仍执行 |
 | Model SQL、Persisted Docs 或 MV DDL Config 变化 | 按 `on_configuration_change` 处理 |
 | `on_configuration_change='apply'` | 构建临时 MV；Immediate 默认等首次构建成功后原子 Replace，关闭等待时提前暴露，Deferred 不产生首次任务 |
-| `on_configuration_change='continue'` | 保留 Doris 中的旧定义并给出警告；不执行 Inside Hook，但仍处理 Outside Hook 和 Grants |
+| `on_configuration_change='continue'` | 保留 Doris 中的旧定义并给出警告；不提交 Manual Refresh、不执行 Inside Hook，但仍处理 Outside Hook 和 Grants |
 | `on_configuration_change='fail'` | 终止运行，不修改已有对象 |
 | 使用 `--full-refresh` | 即使定义未变也重新部署完整定义；只处理 BUILD，不额外提交 Manual Refresh |
 | Table、View 与 MV 互相切换 | 交给目标 Materialization 按真实 Relation Type 处理；各方向的安全边界见下文 |
@@ -376,9 +392,10 @@ view  ↔ materialized_view
 用户不需要先手动 Drop，Adapter 会识别现有 Relation Type 并使用对应 DDL。但
 不同方向的失败保证并不完全相同：
 
-- Table/View → MV：先构建临时 MV；默认 `wait_for_refresh=true` 时，首次构建
-  失败不会切换旧对象，构建成功后才备份旧对象并暴露 MV。关闭等待后不再具备
-  这项首次任务失败保护。
+- Table/View → MV：先构建临时 MV。只有
+  `BUILD IMMEDIATE + wait_for_refresh=true` 时，首次构建失败才不会切换旧对象，
+  构建成功后才备份旧对象并暴露 MV；`BUILD DEFERRED` 没有首次 Task，关闭等待
+  也不具备这项首次任务失败保护。
 - MV → Table：先构建临时 Table，再删除 MV 并把临时 Table 改成目标名；最后的
   类型切换不是 Doris 原子 MV Swap。
 - MV → View：当前 View Materialization 会先删除 MV，再创建 View；如果 CREATE

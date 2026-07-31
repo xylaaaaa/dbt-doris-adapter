@@ -12,8 +12,8 @@ dbt Labs release.
 | Component | Supported baseline |
 | --- | --- |
 | dbt Core | 1.12.x |
-| Apache Doris | 2.1.5 or newer |
-| Doris Async MV | 2.1.5+ on 2.1.x; 3.0.1+; 3.1.x; 4.x |
+| Apache Doris runtime gate | 2.x at 2.1.5 or newer; 3.x except 3.0.0; major version 4 or newer |
+| Doris Async MV version-gate unit tests | 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 |
 | Python | 3.10 or newer |
 | Database protocol | Doris MySQL protocol |
 
@@ -89,8 +89,9 @@ For an unchanged `ON MANUAL` MV, a later `dbt run` submits
 default. The wait defaults to 300 seconds with one-second polling and can be
 tuned with `refresh_wait_timeout` and `refresh_poll_interval`. Set
 `wait_for_refresh=false` to submit without polling. Waiting requires Doris
-materialized-view task history to remain enabled so the adapter can identify
-the task submitted by the current action.
+materialized-view task history to remain enabled. The adapter identifies a task
+by comparing task IDs before and after submission; concurrent refreshes of the
+same MV can therefore be mistaken for the task submitted by dbt.
 
 The supported refresh triggers are `manual`, `schedule`, and `commit`.
 Production schedules accept `minute`, `hour`, `day`, or `week`. The adapter
@@ -102,7 +103,7 @@ Common asynchronous MV settings are:
 | Config | Purpose |
 | --- | --- |
 | `build_mode` | `immediate` (default) builds on create/replace; `deferred` creates without an initial build. |
-| `refresh_method` | Refresh scope: `auto` (default) refreshes changed partitions when Doris can detect them and otherwise falls back to full refresh; `complete` always refreshes all partitions. |
+| `refresh_method` | Refresh scope: `auto` (default) lets Doris select partitions when it can track base-table changes; `complete` always refreshes all partitions. For external tables whose changes Doris cannot detect, use `complete`. |
 | `refresh_trigger` | Trigger: `manual` (default), `schedule`, or `commit`. |
 | `refresh_schedule` | Schedule mapping with `interval`, `unit`, and optional `start_time`. |
 | `wait_for_refresh` | Wait for an initial-build or adapter-submitted manual refresh task; defaults to `true`. |
@@ -125,11 +126,15 @@ This also makes `BUILD DEFERRED + ON MANUAL` deterministic: the first
 `dbt run` only creates the MV, and the second unchanged run submits its first
 refresh.
 
+If the definition changed and `on_configuration_change=continue`, the adapter
+keeps the deployed definition and does not submit a manual refresh.
+
 For an initial build or manual refresh that it waits for, the adapter polls
 Doris `tasks('type'='mv')`; the dbt adapter response includes the successful
 task ID, status, and last query ID when Doris provides one. A failed, canceled,
 unexpected, or timed-out task fails the model instead of being reported as a
-successful action.
+successful action. A dbt timeout does not cancel the asynchronous task already
+submitted to Doris.
 
 Outside-transaction pre-hooks run before deployed-definition inspection.
 Definition changes are built as a temporary MV and exposed through Doris's
@@ -171,17 +176,19 @@ and administer privileges on the target relation.
 
 Asynchronous-MV compatibility is:
 
-| Doris release line | Supported versions |
+| Doris release | Current runtime gate |
 | --- | --- |
-| 2.1 | 2.1.5 and newer 2.1.x releases, including `ON COMMIT` |
-| 3.0 | 3.0.1 and newer; 3.0.0 is excluded |
-| 3.1 | 3.1.x |
-| 4.x | 4.x |
+| 2.x | Version 2.1.5 or newer |
+| 3.x | Every version except 3.0.0 |
+| 4 and newer major versions | Accepted by the current gate |
 
-Before managing an asynchronous MV, the adapter reads the connected and Master
-FE versions from `SHOW FRONTENDS` and rejects an unknown, unparsable, or
-unsupported required FE. Doris 3.0.0 is excluded because it does not provide
-the atomic materialized-view replacement semantics used by this lifecycle.
+Before managing an asynchronous MV, the adapter prefers the connected and
+Master FE versions from `SHOW FRONTENDS`; if neither role can be identified, it
+validates the first returned row. An unparsable or unsupported selected FE is
+rejected. Doris 3.0.0 is excluded because it does not provide the atomic
+materialized-view replacement semantics used by this lifecycle. Acceptance by
+the runtime gate is not a compatibility guarantee for an untested future Doris
+release.
 
 Only Doris asynchronous materialized views are managed. Synchronous
 materialized views (rollups) have a different lifecycle and remain explicitly
