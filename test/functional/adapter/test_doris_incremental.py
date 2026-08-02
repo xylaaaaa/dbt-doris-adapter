@@ -20,13 +20,58 @@
 
 """
 Tests for Doris incremental materialization:
-- append strategy (duplicate key table)
-- insert_overwrite strategy (unique key table)
-- full refresh mode
+- append writes through one INSERT without physical staging
+- merge upserts MOW or MOR Unique Key tables without physical staging
+- Sequence columns keep Doris's native conflict-ordering semantics
+- insert_overwrite performs real whole-table and partition overwrites
+- full refresh replaces the target and preserves its Doris table configuration
 """
 
 import pytest
-from dbt.tests.util import run_dbt, relation_from_name
+from dbt.tests.adapter.incremental.test_incremental_on_schema_change import (
+    BaseIncrementalOnSchemaChange,
+)
+from dbt.tests.util import relation_from_name, run_dbt
+
+
+def _run_and_capture_sql(model_name, args=None, expect_pass=True):
+    """Run dbt and return SQLQuery events for one model.
+
+    Inspecting the catalog after a run only proves that a staging relation was
+    cleaned up. SQLQuery events prove whether dbt physically created and read one
+    during the run.
+    """
+    statements = []
+
+    def capture_sql(event):
+        if event.info.name == "SQLQuery" and event.data.node_info.node_name == model_name:
+            statements.append(" ".join(event.data.sql.lower().split()))
+
+    results = run_dbt(
+        args or ["run"],
+        expect_pass=expect_pass,
+        callbacks=[capture_sql],
+    )
+    return results, list(statements)
+
+
+def _assert_no_physical_dbt_staging(statements):
+    physical_staging_statements = [
+        statement
+        for statement in statements
+        if "__dbt_tmp" in statement and "create table" in statement
+    ]
+    assert physical_staging_statements == []
+
+
+def _dbt_helper_relations(project, relation):
+    return project.run_sql(
+        "select table_name from information_schema.tables "
+        f"where table_schema = '{relation.schema}' "
+        f"and table_name like '{relation.identifier}__dbt_%' "
+        "order by table_name",
+        fetch="all",
+    )
 
 
 # -- Append strategy: works with duplicate key tables --
@@ -35,6 +80,7 @@ INCREMENTAL_APPEND_SQL = """
 {{ config(
     materialized='incremental',
     incremental_strategy='append',
+    duplicate_key=['id'],
     distributed_by=['id'],
     properties={'replication_num': '1'}
 ) }}
@@ -53,15 +99,19 @@ select 3 as id, 'charlie' as name
 """
 
 
-# -- Insert overwrite strategy: works with unique key tables --
+# -- Merge strategy: Doris Unique Key upsert --
 
-INCREMENTAL_UNIQUE_SQL = """
+INCREMENTAL_MERGE_SQL = """
 {{ config(
     materialized='incremental',
-    incremental_strategy='insert_overwrite',
+    incremental_strategy='merge',
     unique_key=['id'],
     distributed_by=['id'],
-    properties={'replication_num': '1'}
+    sql_header='set enable_nereids_planner = true',
+    properties={
+        'replication_num': '1',
+        'enable_unique_key_merge_on_write': 'true'
+    }
 ) }}
 
 {% if is_incremental() %}
@@ -78,17 +128,350 @@ select 3 as id, 'charlie' as name, 300 as score
 """
 
 
+INCREMENTAL_DUPLICATE_KEY_MERGE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['id'],
+    distributed_by=['id'],
+    properties={
+        'replication_num': '1',
+        'enable_unique_key_merge_on_write': 'true'
+    }
+) }}
+
+{% if is_incremental() %}
+select 1 as id, 'conflicting_first' as name
+union all
+select 1 as id, 'conflicting_second' as name
+{% else %}
+select 1 as id, 'alice' as name
+union all
+select 2 as id, 'bob' as name
+{% endif %}
+"""
+
+
+INCREMENTAL_COMPOSITE_MERGE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['tenant_id', 'id'],
+    distributed_by=['tenant_id'],
+    properties={'replication_num': '1'}
+) }}
+
+{% if is_incremental() %}
+select 1 as tenant_id, 1 as id, 'updated' as value
+union all
+select 2 as tenant_id, 2 as id, 'new' as value
+{% else %}
+select 1 as tenant_id, 1 as id, 'old' as value
+union all
+select 1 as tenant_id, 2 as id, 'keep' as value
+union all
+select 2 as tenant_id, 1 as id, 'other_tenant' as value
+{% endif %}
+"""
+
+
+# -- Key columns need not be first in model SQL; CTAS reorders the projection --
+
+INCREMENTAL_REORDERED_KEY_MERGE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+{% if is_incremental() %}
+select 'updated' as value, 1 as id
+{% else %}
+select 'original' as value, 1 as id
+{% endif %}
+"""
+
+
+INCREMENTAL_RESERVED_KEY_MERGE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['order'],
+    distributed_by=['order'],
+    properties={'replication_num': '1'}
+) }}
+
+{% if is_incremental() %}
+select 1 as `order`, 'updated' as value
+{% else %}
+select 1 as `order`, 'original' as value
+{% endif %}
+"""
+
+
+# -- Merge also supports Merge-on-Read Unique Key targets --
+
+INCREMENTAL_MOR_MERGE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['id'],
+    distributed_by=['id'],
+    properties={
+        'replication_num': '1',
+        'enable_unique_key_merge_on_write': 'false'
+    }
+) }}
+
+{% if is_incremental() %}
+select 1 as id, 'alice_updated' as name, 150 as score
+union all
+select 4 as id, 'dave' as name, 400 as score
+{% else %}
+select 1 as id, 'alice' as name, 100 as score
+union all
+select 2 as id, 'bob' as name, 200 as score
+union all
+select 3 as id, 'charlie' as name, 300 as score
+{% endif %}
+"""
+
+
+# -- Sequence ordering is delegated to the Doris Unique Key storage model --
+
+INCREMENTAL_SEQUENCE_MERGE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['id'],
+    distributed_by=['id'],
+    properties={
+        'replication_num': '1',
+        'enable_unique_key_merge_on_write': 'true',
+        'function_column.sequence_col': 'sequence_id'
+    }
+) }}
+
+{% if is_incremental() %}
+select 1 as id, 50 as sequence_id, 'lower_sequence' as value
+{% else %}
+select 1 as id, 100 as sequence_id, 'original' as value
+{% endif %}
+"""
+
+
+# -- Removed strategy: fail before hooks, staging, or target writes --
+
+INCREMENTAL_UNSUPPORTED_DELETE_INSERT_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='delete+insert',
+    unique_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+select 1 as id, 'never_written' as value
+"""
+
+
+# -- Insert overwrite: replace the complete target with the current batch --
+
+INCREMENTAL_OVERWRITE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='insert_overwrite',
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+{% if is_incremental() %}
+select 1 as id, 'alice_replaced' as name
+union all
+select 4 as id, 'dave' as name
+{% else %}
+select 1 as id, 'alice' as name
+union all
+select 2 as id, 'bob' as name
+union all
+select 3 as id, 'charlie' as name
+{% endif %}
+"""
+
+
+# -- Static partition overwrite: replace p1 while retaining p2 --
+
+INCREMENTAL_STATIC_PARTITION_OVERWRITE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='insert_overwrite',
+    overwrite_partitions=['p1'],
+    duplicate_key=['part_id'],
+    partition_by=['part_id'],
+    partition_type='RANGE',
+    partition_by_init=[
+        'PARTITION p1 VALUES LESS THAN ("2")',
+        'PARTITION p2 VALUES LESS THAN ("3")'
+    ],
+    distributed_by=['part_id'],
+    properties={'replication_num': '1'}
+) }}
+
+{% if is_incremental() %}
+select 1 as part_id, 'static_new_p1' as value
+{% else %}
+select 1 as part_id, 'static_old_p1' as value
+union all
+select 2 as part_id, 'static_unchanged_p2' as value
+{% endif %}
+"""
+
+
+# -- Dynamic partition overwrite: replace only partitions present in this batch --
+
+INCREMENTAL_DYNAMIC_PARTITION_OVERWRITE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='insert_overwrite',
+    overwrite_partitions='*',
+    duplicate_key=['part_id'],
+    partition_by=['part_id'],
+    partition_type='RANGE',
+    partition_by_init=[
+        'PARTITION p1 VALUES LESS THAN ("2")',
+        'PARTITION p2 VALUES LESS THAN ("3")'
+    ],
+    distributed_by=['part_id'],
+    properties={'replication_num': '1'}
+) }}
+
+{% if is_incremental() %}
+select 1 as part_id, 'dynamic_new_p1' as value
+{% else %}
+select 1 as part_id, 'dynamic_old_p1' as value
+union all
+select 2 as part_id, 'dynamic_unchanged_p2' as value
+{% endif %}
+"""
+
+
 # -- Full refresh --
 
 INCREMENTAL_FULL_REFRESH_SQL = """
 {{ config(
     materialized='incremental',
     incremental_strategy='append',
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    properties={
+        'replication_num': '1',
+        'disable_auto_compaction': 'true'
+    }
+) }}
+
+select 1 as id, 'only_row' as name
+"""
+
+
+INCREMENTAL_VIEW_TO_TABLE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    duplicate_key=['ASSET_ID'],
+    distributed_by=['ASSET_ID'],
+    properties={'replication_num': '1'}
+) }}
+
+select 7 as `ASSET_ID`, 'new_table' as value
+"""
+
+
+INCREMENTAL_VARCHAR_WIDEN_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    on_schema_change='ignore',
+    duplicate_key=['id'],
     distributed_by=['id'],
     properties={'replication_num': '1'}
 ) }}
 
-select 1 as id, 'only_row' as name
+{% if is_incremental() %}
+select cast(2 as int) as `ID`, cast('expanded' as varchar(40)) as `NAME`
+{% else %}
+select 1 as id, cast('a' as varchar(5)) as name
+{% endif %}
+"""
+
+
+INCREMENTAL_KEY_WIDEN_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+select cast('expanded-key' as varchar(40)) as id, 'new' as value
+"""
+
+
+INCREMENTAL_CASE_ONLY_SCHEMA_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    on_schema_change='sync_all_columns',
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+select cast(2 as int) as `ID`, cast('new' as varchar(20)) as `VALUE`
+"""
+
+
+INCREMENTAL_RECOVERY_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+select *
+from dbt_incremental_intentional_missing_relation
+"""
+
+
+INCREMENTAL_UNSAFE_OVERWRITE_UNIQUE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='insert_overwrite',
+    unique_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+select 1 as id, 'unsafe' as value
+"""
+
+
+INCREMENTAL_INVALID_GRANTS_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    grants={'select': ['role:dbt_incremental_definitely_missing_role']},
+    properties={'replication_num': '1'}
+) }}
+
+select 2 as id, 'must_not_be_written' as value
 """
 
 
@@ -98,7 +481,6 @@ class TestDorisIncrementalAppend:
         return {"incremental_append.sql": INCREMENTAL_APPEND_SQL}
 
     def test_incremental_append(self, project):
-        # First run: creates table with 3 rows
         results = run_dbt(["run"])
         assert len(results) == 1
 
@@ -106,47 +488,603 @@ class TestDorisIncrementalAppend:
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
         assert result[0] == 3
 
-        # Second run: appends 2 more rows
-        results = run_dbt(["run"])
+        results, statements = _run_and_capture_sql("incremental_append")
         assert len(results) == 1
 
-        result = project.run_sql(f"select count(*) from {relation}", fetch="one")
-        assert result[0] == 5
+        rows = project.run_sql(
+            f"select id, name from {relation} order by id",
+            fetch="all",
+        )
+        assert rows == [
+            (1, "alice"),
+            (2, "bob"),
+            (3, "charlie"),
+            (4, "dave"),
+            (5, "eve"),
+        ]
+
+        direct_inserts = [
+            statement
+            for statement in statements
+            if "insert into" in statement and "incremental_append" in statement
+        ]
+        assert len(direct_inserts) == 1
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
 
 
-class TestDorisIncrementalUniqueKey:
+class TestDorisIncrementalMerge:
     @pytest.fixture(scope="class")
     def models(self):
-        return {"incremental_unique.sql": INCREMENTAL_UNIQUE_SQL}
+        return {"incremental_merge.sql": INCREMENTAL_MERGE_SQL}
 
-    def test_incremental_unique_key(self, project):
-        # First run: creates unique key table with 3 rows
+    def test_merge_upserts_without_staging(self, project):
         results = run_dbt(["run"])
         assert len(results) == 1
 
-        relation = relation_from_name(project.adapter, "incremental_unique")
+        relation = relation_from_name(project.adapter, "incremental_merge")
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
         assert result[0] == 3
 
-        # Second run: upserts 2 rows (1 update + 1 new)
+        results, statements = _run_and_capture_sql("incremental_merge")
+        assert len(results) == 1
+
+        rows = project.run_sql(
+            f"select id, name, score from {relation} order by id",
+            fetch="all",
+        )
+        assert rows == [
+            (1, "alice_updated", 150),
+            (2, "bob", 200),
+            (3, "charlie", 300),
+            (4, "dave", 400),
+        ]
+
+        create_table = project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1].lower()
+        assert "unique key" in create_table
+        assert '"enable_unique_key_merge_on_write" = "true"' in create_table
+
+        direct_inserts = [
+            statement
+            for statement in statements
+            if "insert into" in statement and "incremental_merge" in statement
+        ]
+        assert len(direct_inserts) == 1
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalMergeRejectsDuplicateKeys:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_duplicate_key_merge.sql": (INCREMENTAL_DUPLICATE_KEY_MERGE_SQL),
+        }
+
+    def test_duplicate_source_keys_fail_without_changing_target(self, project):
+        assert len(run_dbt(["run"])) == 1
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_duplicate_key_merge",
+        )
+        rows_before = project.run_sql(
+            f"select id, name from {relation} order by id",
+            fetch="all",
+        )
+
+        failure, statements = _run_and_capture_sql(
+            "incremental_duplicate_key_merge",
+            expect_pass=False,
+        )
+        assert len(failure.results) == 1
+        assert any("dbt_internal_duplicate_keys" in statement for statement in statements)
+        _assert_no_physical_dbt_staging(statements)
+
+        rows_after = project.run_sql(
+            f"select id, name from {relation} order by id",
+            fetch="all",
+        )
+        assert (
+            rows_after
+            == rows_before
+            == [
+                (1, "alice"),
+                (2, "bob"),
+            ]
+        )
+
+
+class TestDorisIncrementalCompositeMerge:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"incremental_composite_merge.sql": INCREMENTAL_COMPOSITE_MERGE_SQL}
+
+    def test_merge_uses_all_unique_key_columns(self, project):
+        assert len(run_dbt(["run"])) == 1
+        results, statements = _run_and_capture_sql("incremental_composite_merge")
+        assert len(results) == 1
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_composite_merge",
+        )
+        rows = project.run_sql(
+            f"select tenant_id, id, value from {relation} " "order by tenant_id, id",
+            fetch="all",
+        )
+        assert rows == [
+            (1, 1, "updated"),
+            (1, 2, "keep"),
+            (2, 1, "other_tenant"),
+            (2, 2, "new"),
+        ]
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalReorderedKeyMerge:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_reordered_key_merge.sql": (
+                INCREMENTAL_REORDERED_KEY_MERGE_SQL
+            ),
+        }
+
+    def test_initial_ctas_places_key_first_then_incremental_upserts(self, project):
+        assert len(run_dbt(["run"])) == 1
+        assert len(run_dbt(["run"])) == 1
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_reordered_key_merge",
+        )
+        columns = project.run_sql(
+            "select column_name from information_schema.columns "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{relation.identifier}' "
+            "order by ordinal_position",
+            fetch="all",
+        )
+        assert columns[:2] == [("id",), ("value",)]
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [(1, "updated")]
+
+
+class TestDorisIncrementalReservedKeyMerge:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_reserved_key_merge.sql": (
+                INCREMENTAL_RESERVED_KEY_MERGE_SQL
+            ),
+        }
+
+    def test_reserved_word_key_is_quoted_in_table_ddl(self, project):
+        assert len(run_dbt(["run"])) == 1
+        assert len(run_dbt(["run"])) == 1
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_reserved_key_merge",
+        )
+        assert project.run_sql(
+            f"select `order`, value from {relation}",
+            fetch="all",
+        ) == [(1, "updated")]
+        ddl = project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1]
+        assert "UNIQUE KEY(`order`)" in ddl
+        assert "DISTRIBUTED BY HASH(`order`)" in ddl
+
+
+class TestDorisIncrementalMorMerge:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"incremental_mor_merge.sql": INCREMENTAL_MOR_MERGE_SQL}
+
+    def test_merge_upserts_merge_on_read_target(self, project):
+        assert len(run_dbt(["run"])) == 1
+        results, statements = _run_and_capture_sql("incremental_mor_merge")
+        assert len(results) == 1
+
+        relation = relation_from_name(project.adapter, "incremental_mor_merge")
+        rows = project.run_sql(
+            f"select id, name, score from {relation} order by id",
+            fetch="all",
+        )
+        assert rows == [
+            (1, "alice_updated", 150),
+            (2, "bob", 200),
+            (3, "charlie", 300),
+            (4, "dave", 400),
+        ]
+
+        create_table = (
+            project.run_sql(
+                f"show create table {relation}",
+                fetch="one",
+            )[1]
+            .lower()
+            .replace(" ", "")
+        )
+        assert '"enable_unique_key_merge_on_write"="false"' in create_table
+        assert (
+            len(
+                [
+                    statement
+                    for statement in statements
+                    if "insert into" in statement and "incremental_mor_merge" in statement
+                ]
+            )
+            == 1
+        )
+        assert not any("delete from" in statement for statement in statements)
+        assert not any(statement == "begin" for statement in statements)
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalSequenceMerge:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_sequence_merge.sql": INCREMENTAL_SEQUENCE_MERGE_SQL,
+        }
+
+    def test_lower_sequence_arriving_later_does_not_replace_row(self, project):
+        assert len(run_dbt(["run"])) == 1
+        results, statements = _run_and_capture_sql("incremental_sequence_merge")
+        assert len(results) == 1
+
+        relation = relation_from_name(project.adapter, "incremental_sequence_merge")
+        rows = project.run_sql(
+            f"select id, sequence_id, value from {relation}",
+            fetch="all",
+        )
+        assert rows == [(1, 100, "original")]
+        _assert_no_physical_dbt_staging(statements)
+        assert not any("delete from" in statement for statement in statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalRejectsDeleteInsert:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_unsupported_delete_insert.sql": (
+                INCREMENTAL_UNSUPPORTED_DELETE_INSERT_SQL
+            ),
+        }
+
+    def test_removed_strategy_fails_before_any_sql(self, project):
+        failure, statements = _run_and_capture_sql(
+            "incremental_unsupported_delete_insert",
+            expect_pass=False,
+        )
+        assert len(failure.results) == 1
+        assert "not supported" in failure.results[0].message.lower()
+        assert "use 'merge'" in failure.results[0].message.lower()
+        assert statements == []
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_unsupported_delete_insert",
+        )
+        assert project.adapter.get_relation(
+            database=relation.database,
+            schema=relation.schema,
+            identifier=relation.identifier,
+        ) is None
+
+
+class TestDorisIncrementalRejectsLegacyOverwriteUniqueKey:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_unsafe_overwrite_unique.sql": (
+                INCREMENTAL_UNSAFE_OVERWRITE_UNIQUE_SQL
+            ),
+        }
+
+    def test_legacy_combination_fails_before_any_sql(self, project):
+        failure, statements = _run_and_capture_sql(
+            "incremental_unsafe_overwrite_unique",
+            expect_pass=False,
+        )
+        assert len(failure.results) == 1
+        assert "could silently" in failure.results[0].message.lower()
+        assert "strategy='merge'" in failure.results[0].message.lower()
+        assert statements == []
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_unsafe_overwrite_unique",
+        )
+        assert project.adapter.get_relation(
+            database=relation.database,
+            schema=relation.schema,
+            identifier=relation.identifier,
+        ) is None
+
+
+class TestDorisIncrementalGrantPreflight:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"incremental_invalid_grants.sql": INCREMENTAL_INVALID_GRANTS_SQL}
+
+    def test_invalid_grants_fail_before_incremental_dml(self, project):
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_invalid_grants",
+        )
+        project.run_sql(
+            f"create table {relation} ("
+            "`id` int, `value` varchar(40)"
+            ") duplicate key(`id`) "
+            "distributed by hash(`id`) buckets auto "
+            'properties("replication_num" = "1")'
+        )
+        project.run_sql(f"insert into {relation} values (1, 'original')")
+
+        failure, statements = _run_and_capture_sql(
+            "incremental_invalid_grants",
+            expect_pass=False,
+        )
+        assert len(failure.results) == 1
+        assert "do not exist" in failure.results[0].message.lower()
+        assert not any("insert into" in statement for statement in statements)
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [(1, "original")]
+
+
+class TestDorisIncrementalInsertOverwrite:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"incremental_overwrite.sql": INCREMENTAL_OVERWRITE_SQL}
+
+    def test_whole_table_insert_overwrite_removes_old_rows(self, project):
         results = run_dbt(["run"])
         assert len(results) == 1
 
+        relation = relation_from_name(project.adapter, "incremental_overwrite")
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
-        assert result[0] == 4
+        assert result[0] == 3
 
-        # Verify id=1 was updated
-        result = project.run_sql(
-            f"select name, score from {relation} where id = 1", fetch="one"
-        )
-        assert result[0] == "alice_updated"
-        assert result[1] == 150
+        results, statements = _run_and_capture_sql("incremental_overwrite")
+        assert len(results) == 1
 
-        # Verify id=2 remains unchanged
-        result = project.run_sql(
-            f"select name from {relation} where id = 2", fetch="one"
+        rows = project.run_sql(
+            f"select id, name from {relation} order by id",
+            fetch="all",
         )
-        assert result[0] == "bob"
+        assert rows == [
+            (1, "alice_replaced"),
+            (4, "dave"),
+        ]
+
+        overwrite_statements = [
+            statement
+            for statement in statements
+            if "insert overwrite" in statement and "incremental_overwrite" in statement
+        ]
+        assert len(overwrite_statements) == 1
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalStaticPartitionOverwrite:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_static_partition_overwrite.sql": (
+                INCREMENTAL_STATIC_PARTITION_OVERWRITE_SQL
+            ),
+        }
+
+    def test_static_partition_overwrite_replaces_only_named_partition(self, project):
+        results = run_dbt(["run"])
+        assert len(results) == 1
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_static_partition_overwrite",
+        )
+        results, statements = _run_and_capture_sql("incremental_static_partition_overwrite")
+        assert len(results) == 1
+
+        rows = project.run_sql(
+            f"select part_id, value from {relation} order by part_id",
+            fetch="all",
+        )
+        assert rows == [
+            (1, "static_new_p1"),
+            (2, "static_unchanged_p2"),
+        ]
+
+        overwrite_statements = [
+            statement
+            for statement in statements
+            if "insert overwrite" in statement
+            and "incremental_static_partition_overwrite" in statement
+        ]
+        assert len(overwrite_statements) == 1
+        assert "partition(`p1`)" in overwrite_statements[0].replace(" ", "")
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalDynamicPartitionOverwrite:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_dynamic_partition_overwrite.sql": (
+                INCREMENTAL_DYNAMIC_PARTITION_OVERWRITE_SQL
+            ),
+        }
+
+    def test_dynamic_partition_overwrite_preserves_unseen_partitions(self, project):
+        results = run_dbt(["run"])
+        assert len(results) == 1
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_dynamic_partition_overwrite",
+        )
+        results, statements = _run_and_capture_sql("incremental_dynamic_partition_overwrite")
+        assert len(results) == 1
+
+        rows = project.run_sql(
+            f"select part_id, value from {relation} order by part_id",
+            fetch="all",
+        )
+        assert rows == [
+            (1, "dynamic_new_p1"),
+            (2, "dynamic_unchanged_p2"),
+        ]
+
+        overwrite_statements = [
+            statement
+            for statement in statements
+            if "insert overwrite" in statement
+            and "incremental_dynamic_partition_overwrite" in statement
+        ]
+        assert len(overwrite_statements) == 1
+        assert "partition(*)" in overwrite_statements[0].replace(" ", "")
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalVarcharWidening:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_varchar_widen.sql": INCREMENTAL_VARCHAR_WIDEN_SQL,
+        }
+
+    def test_ignore_widens_string_without_physical_staging(self, project):
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_varchar_widen",
+        )
+        project.run_sql(
+            f"create table {relation} ("
+            "`id` int, `name` varchar(5)"
+            ") duplicate key(`id`) "
+            "distributed by hash(`id`) buckets auto "
+            'properties("replication_num" = "1")'
+        )
+        project.run_sql(f"insert into {relation} values (1, 'a')")
+
+        results, statements = _run_and_capture_sql("incremental_varchar_widen")
+        assert len(results) == 1
+
+        rows = project.run_sql(
+            f"select id, name from {relation} order by id",
+            fetch="all",
+        )
+        assert rows == [(1, "a"), (2, "expanded")]
+
+        column_type = project.run_sql(
+            "select column_type from information_schema.columns "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{relation.identifier}' "
+            "and column_name = 'name'",
+            fetch="one",
+        )[0]
+        widened_size = int(column_type.lower().removeprefix("varchar(").removesuffix(")"))
+        assert widened_size >= 40
+        assert any(
+            "create or replace view" in statement and "__dbt_tmp" in statement
+            for statement in statements
+        )
+        _assert_no_physical_dbt_staging(statements)
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalKeyWidening:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"incremental_key_widen.sql": INCREMENTAL_KEY_WIDEN_SQL}
+
+    def test_default_ignore_rejects_unique_key_type_change_before_alter(self, project):
+        relation = relation_from_name(project.adapter, "incremental_key_widen")
+        project.run_sql(
+            f"create table {relation} ("
+            "`id` varchar(5), `value` varchar(20)"
+            ") unique key(`id`) "
+            "distributed by hash(`id`) buckets auto "
+            'properties("replication_num" = "1", '
+            '"enable_unique_key_merge_on_write" = "true")'
+        )
+        project.run_sql(f"insert into {relation} values ('old', 'original')")
+
+        failure = run_dbt(["run"], expect_pass=False)
+        assert len(failure.results) == 1
+        assert "--full-refresh" in failure.results[0].message
+
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [("old", "original")]
+        column_type = project.run_sql(
+            "select column_type from information_schema.columns "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{relation.identifier}' "
+            "and column_name = 'id'",
+            fetch="one",
+        )[0]
+        assert column_type.lower() == "varchar(5)"
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalCaseOnlySchemaChange:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_case_only_schema.sql": (
+                INCREMENTAL_CASE_ONLY_SCHEMA_SQL
+            ),
+        }
+
+    def test_case_only_alias_change_is_not_add_drop(self, project):
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_case_only_schema",
+        )
+        project.run_sql(
+            f"create table {relation} ("
+            "`id` int, `value` varchar(20)"
+            ") duplicate key(`id`) "
+            "distributed by hash(`id`) buckets auto "
+            'properties("replication_num" = "1")'
+        )
+        project.run_sql(f"insert into {relation} values (1, 'original')")
+
+        assert len(run_dbt(["run"])) == 1
+        assert project.run_sql(
+            f"select id, value from {relation} order by id",
+            fetch="all",
+        ) == [(1, "original"), (2, "new")]
+        columns = project.run_sql(
+            "select column_name from information_schema.columns "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{relation.identifier}' "
+            "order by ordinal_position",
+            fetch="all",
+        )
+        assert columns == [("id",), ("value",)]
+        assert _dbt_helper_relations(project, relation) == []
 
 
 class TestDorisIncrementalFullRefresh:
@@ -155,7 +1093,6 @@ class TestDorisIncrementalFullRefresh:
         return {"incremental_fr.sql": INCREMENTAL_FULL_REFRESH_SQL}
 
     def test_full_refresh(self, project):
-        # First run
         results = run_dbt(["run"])
         assert len(results) == 1
 
@@ -163,15 +1100,121 @@ class TestDorisIncrementalFullRefresh:
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
         assert result[0] == 1
 
-        # Second run: normal incremental (appends same row)
         results = run_dbt(["run"])
         assert len(results) == 1
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
         assert result[0] == 2
 
-        # Full refresh: should reset to 1 row
-        results = run_dbt(["run", "--full-refresh"])
+        results, statements = _run_and_capture_sql(
+            "incremental_fr",
+            ["run", "--full-refresh"],
+        )
         assert len(results) == 1
 
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
         assert result[0] == 1
+
+        create_table = project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1].lower()
+        assert "duplicate key" in create_table
+        assert "distributed by hash(`id`)" in create_table
+        assert '"disable_auto_compaction" = "true"' in create_table
+
+        # Full refresh intentionally builds an intermediate table before the
+        # atomic REPLACE WITH TABLE. The no-staging rule applies to ordinary
+        # incremental DML, not to safe full-refresh replacement.
+        assert any(
+            "create table" in statement and "incremental_fr__dbt_tmp" in statement
+            for statement in statements
+        )
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalViewToTable:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_view_to_table.sql": INCREMENTAL_VIEW_TO_TABLE_SQL,
+        }
+
+    def test_view_with_as_identifier_is_replaced_by_table(self, project):
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_view_to_table",
+        )
+        backup_name = f"{relation.identifier}__dbt_backup"
+        project.run_sql(
+            f"create view `{relation.schema}`.`{backup_name}` as "
+            "select -1 as `ASSET_ID`, 'stale_backup' as `value`"
+        )
+        project.run_sql(
+            f"create view {relation} "
+            "(`ASSET_ID` comment 'identifier AS label', `value`) "
+            "comment 'view AS metadata' as "
+            "select 99 as `ASSET_ID`, 'old_view' as `value`"
+        )
+
+        results = run_dbt(["run"])
+        assert len(results) == 1
+
+        rows = project.run_sql(
+            f"select `ASSET_ID`, `value` from {relation}",
+            fetch="all",
+        )
+        assert rows == [(7, "new_table")]
+        table_type = project.run_sql(
+            "select table_type from information_schema.tables "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{relation.identifier}'",
+            fetch="one",
+        )[0]
+        assert table_type == "BASE TABLE"
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalBackupRecovery:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"incremental_recovery.sql": INCREMENTAL_RECOVERY_SQL}
+
+    def test_restores_view_backup_before_a_failed_retry(self, project):
+        relation = relation_from_name(project.adapter, "incremental_recovery")
+        backup_name = f"{relation.identifier}__dbt_backup"
+        project.run_sql(
+            f"create view `{relation.schema}`.`{backup_name}` "
+            "(`id` comment 'id AS label', `value`) "
+            "comment 'backup AS metadata' "
+            "as select 99 as id, 'old_definition' as value"
+        )
+
+        failure = run_dbt(["run"], expect_pass=False)
+        assert len(failure.results) == 1
+
+        rows = project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        )
+        assert rows == [(99, "old_definition")]
+        restored_ddl = project.run_sql(
+            f"show create view {relation}",
+            fetch="one",
+        )[1]
+        assert "id AS label" in restored_ddl
+        assert "backup AS metadata" in restored_ddl
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalOnSchemaChange(BaseIncrementalOnSchemaChange):
+    """Run dbt's 1.12 schema-change contract against logical source views."""
+
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {
+            "models": {
+                "+properties": {
+                    "replication_num": "1",
+                }
+            }
+        }

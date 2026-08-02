@@ -5,13 +5,13 @@
 - 只以 **dbt Core 1.12.x** 为开发和测试基线，Python 使用 3.10+。
 - 当前只开发 Python dbt Adapter，不同时开发 Fusion Adapter。
 - 覆盖 dbt Core 1.12 官方五种 Model Materialization。
-- Incremental 对齐 dbt Core 1.12 的五种内置策略：
+- Incremental 有意支持 dbt Core 1.12 中适合 Doris 的三种内置策略；
+  `microbatch` 留到 P1，`delete+insert` 不支持：
 
 | 策略 | Doris 实现 | 阶段 |
 | --- | --- | --- |
 | `append` | `INSERT INTO` 追加 | P0 |
 | `merge` | Unique Key 表 + `INSERT INTO` Upsert | P0 |
-| `delete+insert` | 按 `unique_key` 删除后重新插入 | P0 |
 | `insert_overwrite` | Doris 原生 `INSERT OVERWRITE` | P0 |
 | `microbatch` | 按 `event_time` 拆分时间批次 | P1 |
 
@@ -52,63 +52,68 @@ Materialization；其 Doris 兼容工作放在 P1。
 
 ## P0：完善 Incremental 基础策略
 
-- [ ] 接入 dbt 1.12 标准 Incremental Strategy Dispatch 和对应策略宏。
-- [ ] 未支持的策略或配置在执行 SQL 前明确报错。
-- [ ] 完善策略与 Doris 表模型的映射：
+- [x] 接入 dbt 1.12 标准 Incremental Strategy Dispatch 和对应策略宏。
+- [x] 未支持的策略或配置在执行 SQL 前明确报错。
+- [x] 完善策略与 Doris 表模型的映射：
   - `append` 使用 Duplicate Key；
-  - `merge` 使用 Merge-on-Write Unique Key；
-  - `delete+insert` 和 `insert_overwrite` 校验目标表模型是否兼容。
-- [ ] 首次建表、普通增量和 Full Refresh 共用 Duplicate/Unique Key DDL，
+  - `merge` 使用 MOW 或 MOR Unique Key；
+  - `insert_overwrite` 使用 Doris 原生整表或分区覆盖。
+- [x] 首次建表、普通增量和 Full Refresh 共用 Duplicate/Unique Key DDL，
   并保留 Key、Partition、Distribution 和 Properties。
+- [x] 普通三策略仅使用逻辑 `__dbt_tmp` View 获取列元数据，最终执行一条
+  DML；Schema Change 和自定义策略才创建物理 staging table。
 
 ### `append`
 
-- [ ] 保留当前 Duplicate Key 表 + `INSERT INTO` 实现。
-- [ ] 测试首次创建、重复运行和 Full Refresh。
+- [x] 保留当前 Duplicate Key 表 + `INSERT INTO` 实现。
+- [x] 测试首次创建、重复运行和 Full Refresh。
 
 ### `merge`
 
-- [ ] 将当前错误命名的 `insert_overwrite` 路径改为 `merge`。
-- [ ] 要求配置 `unique_key`，支持单列和复合 Key。
-- [ ] 首次运行创建 Merge-on-Write Unique Key 目标表。
-- [ ] 后续运行继续使用 `INSERT INTO`，利用 Unique Key 完成 Upsert。
-- [ ] 校验现有目标表的 Key 类型和 Key 列；不兼容时提示
+- [x] 将当前错误命名的 `insert_overwrite` 路径改为 `merge`。
+- [x] 要求配置 `unique_key`，支持单列和复合 Key。
+- [x] 首次运行默认创建 Merge-on-Write Unique Key 目标表，并允许显式 MOR。
+- [x] 后续运行继续使用一条 `INSERT INTO`，利用 Unique Key 完成完整行
+  Upsert；可见 `function_column.sequence_col` 继续由 Doris 存储层裁决，
+  需要隐藏列的 `function_column.sequence_type` 明确拒绝。
+- [x] 校验现有目标表的 Key 类型和 Key 列；不兼容时提示
   `--full-refresh`。
-- [ ] 测试更新已有行、插入新行、保留本批未出现的旧行。
+- [x] 测试更新已有行、插入新行、保留本批未出现的旧行、MOW/MOR、
+  复合 Key、重复 Source Key 和 Sequence。
 
 ### `delete+insert`
 
-- [ ] 要求配置 `unique_key`，支持单列和复合 Key。
-- [ ] 使用临时表确定本批 Key，先删除目标表中的匹配行，再插入本批结果。
-- [ ] 测试已有 Key 替换、新 Key 插入、未匹配旧行保留和失败恢复。
+- [x] 有意不实现。`delete+insert` 和 `delete_insert` 都在 Hook 或写入前拒绝，
+  并提示使用 `merge`。因此 Adapter 不包含两语句事务、物理批次表或 Doris
+  版本门禁。
 
 ### `insert_overwrite`
 
-- [ ] 不再要求 `unique_key`。
-- [ ] 首先实现整表覆盖：
+- [x] 不再要求 `unique_key`。
+- [x] 实现整表覆盖：
 
 ```sql
 INSERT OVERWRITE TABLE target
 SELECT ...;
 ```
 
-- [ ] 再实现指定分区覆盖：
+- [x] 实现指定分区和 `PARTITION(*)` 动态覆盖：
 
 ```sql
 INSERT OVERWRITE TABLE target PARTITION (p1, p2)
 SELECT ...;
 ```
 
-- [ ] 测试覆盖范围内旧数据被删除、非覆盖分区保持不变。
-- [ ] 明确失败清理和重试行为。
+- [x] 测试覆盖范围内旧数据被删除、非覆盖分区保持不变。
+- [x] 明确失败清理和重试行为。
 
 ### 兼容和迁移
 
-- [ ] 旧项目若想按 Key Upsert，将
-  `incremental_strategy='insert_overwrite'` 改为 `merge`。
-- [ ] 旧项目若想覆盖整表或分区，继续使用 `insert_overwrite`。
-- [ ] 在 Release Note 中明确这是行为修正：新的 `insert_overwrite` 会删除
-  覆盖范围内未出现在本批的数据。
+- [x] 旧项目的 `insert_overwrite + unique_key` 组合在写入前拒绝，避免从
+  Upsert 静默变成会删除缺失行的覆盖语义；按 Key Upsert 时改为 `merge`。
+- [x] 旧项目若想覆盖整表或分区，继续使用 `insert_overwrite`，并删除
+  `unique_key` 以显式选择原生覆盖。
+- [x] 在 README 和 Incremental 指南中写明迁移保护与原生覆盖的删除语义。
 
 ## P0：实现 Materialized View
 
@@ -169,10 +174,10 @@ View，不作为 Incremental Strategy。
 
 - [ ] `microbatch`：支持 `event_time`、`begin`、`batch_size`、`lookback`
   和并行批次。
-- [ ] `on_schema_change`：支持 `ignore`、`fail`、
+- [x] `on_schema_change`：支持 `ignore`、`fail`、
   `append_new_columns`、`sync_all_columns`。
-- [ ] Merge 配置：支持 `merge_update_columns`、
-  `merge_exclude_columns` 和 `incremental_predicates`；无法支持的组合明确报错。
+- [x] Merge 配置：`merge_update_columns`、`merge_exclude_columns` 和
+  `incremental_predicates` 在原生 `MERGE INTO` 路径实现前明确报错。
 
 ## P1：补齐 dbt 通用能力
 

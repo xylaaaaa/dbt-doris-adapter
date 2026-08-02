@@ -51,7 +51,7 @@
       {%- endif -%}
     DUPLICATE KEY (
       {% for item in cols %}
-        {{ item }}
+        {{ adapter.quote(item) }}
       {% if not loop.last %},{% endif %}
       {% endfor %}
     )
@@ -75,14 +75,14 @@
 
     UNIQUE KEY (
       {% for item in cols %}
-        {{ item }}
+        {{ adapter.quote(item) }}
       {% if not loop.last %},{% endif %}
       {% endfor %}
     )
   {% endif %}
 {%- endmacro %}
 
-{% macro doris__distributed_by(column_names) -%}
+{% macro doris__distributed_by(column_names=none) -%}
   {% set engine = config.get('engine', validator=validation.any[basestring]) %}
   {% set cols = config.get('distributed_by', validator=validation.any[list, basestring]) %}
   {% if cols is none and engine in [none,'OLAP'] %}
@@ -95,24 +95,32 @@
       {%- endif -%}
     DISTRIBUTED BY HASH (
       {% for item in cols %}
-        {{ item }}{% if not loop.last %},{% endif %}
+        {{ adapter.quote(item) }}{% if not loop.last %},{% endif %}
       {% endfor %}
     ) BUCKETS {{ config.get('buckets', validator=validation.any[int]) or 10 }}
   {% endif %}
 {%- endmacro %}
 
-{% macro doris__properties() -%}
-  {% set properties = config.get('properties', validator=validation.any[dict]) %}
-  {% set replice_num =  config.get('replication_num') %}
+{% macro doris__properties(default_properties=none) -%}
+  {# Work on a new dictionary. Mutating config.get('properties') leaks adapter
+     defaults into the parsed model config used by later macros. #}
+  {% set properties = {} %}
+  {% if default_properties %}
+    {% do properties.update(default_properties) %}
+  {% endif %}
+
+  {% set configured_properties = config.get('properties', validator=validation.any[dict]) %}
+  {% if configured_properties %}
+    {% do properties.update(configured_properties) %}
+  {% endif %}
+
+  {% set replice_num = config.get('replication_num') %}
 
   {% if replice_num is not none %}
-    {% if properties is none %}
-      {% set properties = {} %}
-    {% endif %}
     {% do properties.update({'replication_num': replice_num}) %}
   {% endif %}
 
-  {% if properties is not none %}
+  {% if properties %}
     PROPERTIES (
         {% for key, value in properties.items() %}
           "{{ key }}" = "{{ value }}"{% if not loop.last %},{% endif %}
@@ -143,6 +151,10 @@
     {% endcall %}
 {%- endmacro %}
 
+{% macro doris__view_query_from_show_create(show_create_sql) -%}
+  {{ return(adapter.view_query_from_show_create(show_create_sql)) }}
+{%- endmacro %}
+
 {% macro doris__rename_relation(from_relation, to_relation) -%}
   {% call statement('drop_relation') %}
     drop {{ 'materialized view' if to_relation.type == 'materialized_view' else to_relation.type }} if exists {{ to_relation }}
@@ -150,7 +162,10 @@
   {% call statement('rename_relation') %}
     {% if to_relation.is_view %}
     {% set results = run_query('show create view ' + from_relation.render() ) %}
-    create view {{ to_relation }} as {{ results[0]['Create View'].split('AS',1)[1] }}
+    {{ adapter.rewrite_view_ddl(
+        results[0]['Create View'],
+        to_relation.render()
+    ) }}
     {% elif to_relation.type == 'materialized_view' %}
     alter materialized view {{ from_relation }} rename `{{ to_relation.table | replace("`", "``") }}`
     {% else %}
@@ -173,13 +188,17 @@
     {% set from_results = run_query('show create view ' + relation1.render() ) %}
     {% set to_results = run_query('show create view ' + relation2.render() ) %}
       {% call statement('exchange_view_relation') %}
-        alter view {{ relation1 }} as {{  to_results[0]['Create View'].split('AS',1)[1] }}
+        alter view {{ relation1 }} as {{ doris__view_query_from_show_create(
+            to_results[0]['Create View']
+        ) }}
       {% endcall %}
     {% if is_drop_r1 %}
       {% do doris__drop_relation(relation2) %}
     {% else %}
       {% call statement('exchange_view_relation') %}
-        alter view {{ relation2 }} as {{  from_results[0]['Create View'].split('AS',1)[1] }}
+        alter view {{ relation2 }} as {{ doris__view_query_from_show_create(
+            from_results[0]['Create View']
+        ) }}
       {% endcall %}
     {% endif %}
   {% else %}
@@ -220,7 +239,9 @@
 {% endmacro %}
 
 {% macro drop_relation_if_exists(relation) %}
-  {{ doris__drop_relation(relation) }}
+  {% if relation is not none %}
+    {% do adapter.drop_relation(relation) %}
+  {% endif %}
 {% endmacro %}
 
 {% macro create_indexes(relation) -%}

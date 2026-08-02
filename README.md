@@ -12,6 +12,7 @@ dbt Labs release.
 | Component | Development or test baseline |
 | --- | --- |
 | dbt Core | 1.12.x |
+| Doris Incremental live-cluster E2E | 4.1.2-rc01 (`doris-4.1.2-rc01-4536b29f712`) |
 | Doris Async MV live-cluster E2E | 4.1.2-rc01 (`doris-4.1.2-rc01-4536b29f712`) |
 | Doris Async MV gate unit tests | Mocked version strings for 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 |
 | Python | 3.10 or newer |
@@ -58,6 +59,43 @@ your_profile_name:
 The adapter contains Doris implementations for table, view, incremental,
 partition, snapshot, seed, and asynchronous materialized-view workflows.
 Ephemeral models are compiled by dbt Core.
+
+### Incremental models
+
+The built-in Doris incremental strategies are `append`, `merge`, and
+`insert_overwrite`. If `incremental_strategy` is omitted, a model with a
+`unique_key` uses `merge`; a model without one uses `append`.
+
+| Strategy | Target model | Incremental DML |
+| --- | --- | --- |
+| `append` | Duplicate Key | `INSERT INTO` append |
+| `merge` | MOW or MOR Unique Key | full-row `INSERT INTO` upsert |
+| `insert_overwrite` | writable Doris table | native whole-table or partition `INSERT OVERWRITE` |
+
+`merge` describes dbt's result semantics. It does not currently emit native
+`MERGE INTO`: Doris Unique Key storage resolves the upsert, including ordering
+from a visible column configured through `function_column.sequence_col`. The
+source batch must contain each configured key at most once. Partial-column merge
+configs and incremental predicates remain unsupported.
+
+Ordinary updates to an existing target with `on_schema_change='ignore'` create a
+temporary logical view for column metadata, but do not copy the batch into a
+physical staging table. Each built-in strategy then performs one final DML
+statement. Schema-changing runs use a physical staging table to freeze the
+batch, while full refresh builds an intermediate table and exposes it through a
+metadata swap.
+
+`delete+insert` (including the `delete_insert` spelling) is intentionally not
+supported; use `merge` for Unique Key upserts. This release also corrects the
+old adapter behavior where an explicitly configured `insert_overwrite` acted
+like an upsert. To prevent a silent change to destructive overwrite semantics,
+the legacy combination `insert_overwrite + unique_key` is rejected: change the
+strategy to `merge` for upserts, or remove `unique_key` to explicitly opt in to
+native overwrite, which can remove rows absent from the new batch. See the
+[Chinese incremental guide](https://github.com/xylaaaaa/dbt-doris-adapter/blob/main/docs/incremental.zh-CN.md)
+for configuration and migration details.
+
+### Asynchronous materialized views
 
 To manage a Doris asynchronous materialized view, configure a model with
 `materialized='materialized_view'`:
