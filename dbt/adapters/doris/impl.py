@@ -64,166 +64,6 @@ _DORIS_DBT_USER_PRINCIPAL = re.compile(
 _DORIS_VERSION = re.compile(
     r"(?:^|doris-)(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
 )
-_DORIS_CREATE_VIEW_PREFIX = re.compile(
-    r"\A(?P<prefix>\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+)",
-    re.IGNORECASE,
-)
-
-
-def _doris_view_query_from_show_create(show_create_sql: str) -> str:
-    """Extract a Doris view query without treating quoted ``AS`` as syntax."""
-    quote = None
-    parenthesis_depth = 0
-    line_comment = False
-    block_comment = False
-    index = 0
-
-    while index < len(show_create_sql):
-        character = show_create_sql[index]
-        following = (
-            show_create_sql[index + 1]
-            if index + 1 < len(show_create_sql)
-            else ""
-        )
-
-        if line_comment:
-            if character in "\r\n":
-                line_comment = False
-            index += 1
-            continue
-
-        if block_comment:
-            if character == "*" and following == "/":
-                block_comment = False
-                index += 2
-            else:
-                index += 1
-            continue
-
-        if quote is not None:
-            if character == "\\" and following:
-                index += 2
-                continue
-            if character == quote:
-                if following == quote:
-                    index += 2
-                    continue
-                quote = None
-            index += 1
-            continue
-
-        if character in "'\"`":
-            quote = character
-            index += 1
-            continue
-        if character == "#":
-            line_comment = True
-            index += 1
-            continue
-        if character == "-" and following == "-":
-            line_comment = True
-            index += 2
-            continue
-        if character == "/" and following == "*":
-            block_comment = True
-            index += 2
-            continue
-        if character == "(":
-            parenthesis_depth += 1
-            index += 1
-            continue
-        if character == ")":
-            parenthesis_depth -= 1
-            index += 1
-            continue
-
-        token = show_create_sql[index:index + 2]
-        previous = show_create_sql[index - 1] if index else ""
-        after = (
-            show_create_sql[index + 2]
-            if index + 2 < len(show_create_sql)
-            else ""
-        )
-        if (
-            parenthesis_depth == 0
-            and token.casefold() == "as"
-            and not (previous.isalnum() or previous in "_$")
-            and not (after.isalnum() or after in "_$")
-        ):
-            query = show_create_sql[index + 2:].strip()
-            if query.endswith(";"):
-                query = query[:-1].rstrip()
-            if query:
-                return query
-            break
-        index += 1
-
-    raise dbt.exceptions.DbtRuntimeError(
-        "Could not extract the Doris view query from SHOW CREATE VIEW output."
-    )
-
-
-def _consume_doris_identifier(sql: str, start: int) -> int:
-    """Return the end of one identifier component in a CREATE VIEW statement."""
-    if start >= len(sql):
-        raise dbt.exceptions.DbtRuntimeError(
-            "Could not parse the view name in SHOW CREATE VIEW output."
-        )
-    if sql[start] in "`\"":
-        quote = sql[start]
-        index = start + 1
-        while index < len(sql):
-            if sql[index] == "\\" and index + 1 < len(sql):
-                index += 2
-                continue
-            if sql[index] == quote:
-                if index + 1 < len(sql) and sql[index + 1] == quote:
-                    index += 2
-                    continue
-                return index + 1
-            index += 1
-        raise dbt.exceptions.DbtRuntimeError(
-            "Could not parse the quoted view name in SHOW CREATE VIEW output."
-        )
-
-    match = re.match(r"[A-Za-z_][A-Za-z0-9_$]*", sql[start:])
-    if match is None:
-        raise dbt.exceptions.DbtRuntimeError(
-            "Could not parse the view name in SHOW CREATE VIEW output."
-        )
-    return start + match.end()
-
-
-def _rewrite_doris_view_ddl(show_create_sql: str, new_relation_sql: str) -> str:
-    """Rewrite only the relation name in a complete Doris CREATE VIEW DDL."""
-    prefix_match = _DORIS_CREATE_VIEW_PREFIX.match(show_create_sql)
-    if prefix_match is None:
-        raise dbt.exceptions.DbtRuntimeError(
-            "SHOW CREATE VIEW did not return a CREATE VIEW statement."
-        )
-
-    cursor = prefix_match.end()
-    relation_end = cursor
-    while True:
-        while cursor < len(show_create_sql) and show_create_sql[cursor].isspace():
-            cursor += 1
-        relation_end = _consume_doris_identifier(show_create_sql, cursor)
-        cursor = relation_end
-        while cursor < len(show_create_sql) and show_create_sql[cursor].isspace():
-            cursor += 1
-        if cursor >= len(show_create_sql) or show_create_sql[cursor] != ".":
-            break
-        cursor += 1
-
-    if not new_relation_sql.strip():
-        raise dbt.exceptions.DbtRuntimeError(
-            "The replacement Doris view name must not be empty."
-        )
-    return (
-        show_create_sql[:prefix_match.end()]
-        + new_relation_sql
-        + show_create_sql[relation_end:]
-    )
 
 
 @dataclass
@@ -523,6 +363,20 @@ class DorisAdapter(SQLAdapter):
         """Return the built-in incremental strategies implemented by dbt-doris."""
         return ["append", "merge", "insert_overwrite"]
 
+    def rename_relation(self, from_relation, to_relation):
+        """Reject View renames before dbt mutates its relation cache.
+
+        Doris cannot safely move a View through dbt's generic rename path.
+        Callers that replace a View must first snapshot its currently evaluated
+        rows to a Table.
+        """
+        if from_relation.is_view or to_relation.is_view:
+            raise dbt.exceptions.DbtRuntimeError(
+                "Doris cannot safely rename a View. Snapshot the View to a "
+                "Table first."
+            )
+        return super().rename_relation(from_relation, to_relation)
+
     def expand_column_types(self, goal, current):
         """Widen string columns using Doris's case-insensitive name rules."""
         reference_columns = {
@@ -548,16 +402,6 @@ class DorisAdapter(SQLAdapter):
                     target_column.name,
                     new_type,
                 )
-
-    @available
-    def view_query_from_show_create(self, show_create_sql: str) -> str:
-        return _doris_view_query_from_show_create(show_create_sql)
-
-    @available
-    def rewrite_view_ddl(
-            self, show_create_sql: str, new_relation_sql: str
-    ) -> str:
-        return _rewrite_doris_view_ddl(show_create_sql, new_relation_sql)
 
     def _latest_schema_change_job(self, relation: BaseRelation):
         schema = self.quote(relation.schema)

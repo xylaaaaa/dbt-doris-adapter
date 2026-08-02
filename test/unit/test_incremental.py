@@ -23,15 +23,16 @@
 import pytest
 
 from dbt.adapters.doris.column import DorisColumn
-from dbt.adapters.doris.impl import (
-    DorisAdapter,
-    _doris_view_query_from_show_create,
-    _rewrite_doris_view_ddl,
-)
+from dbt.adapters.doris.impl import DorisAdapter
 from dbt.adapters.doris.relation import DorisRelation
 from dbt.exceptions import DbtRuntimeError
 
-from .macro_harness import MacroRunner
+from .macro_harness import (
+    CapturedCompilerError,
+    FakeConfig,
+    FakeRelation,
+    MacroRunner,
+)
 
 
 @pytest.mark.parametrize(
@@ -57,60 +58,255 @@ def test_doris_column_widens_with_valid_varchar_syntax():
     assert DorisColumn.string_type(source.string_size()) == "varchar(40)"
 
 
-@pytest.mark.parametrize(
-    "show_create_sql",
-    [
-        (
-            "CREATE VIEW `events`\n"
-            "(ASSET_ID, VALUE)\n"
-            " AS select 1 AS `ASSET_ID`, 'current' AS `VALUE`;"
-        ),
-        (
-            "CREATE VIEW `events`\n"
-            "(friendly COMMENT 'render AS label')\n"
-            " COMMENT 'view AS comment' AS "
-            "select 1 AS `friendly`;"
-        ),
-        (
-            "CREATE VIEW `events`\n"
-            "(`order AS label`) /* metadata AS text */\n"
-            " AS select 1 AS `order AS label`;"
-        ),
-    ],
-)
-def test_view_query_extraction_ignores_as_outside_the_query(show_create_sql):
-    expected = show_create_sql.rsplit(" AS select", 1)[1]
-    expected = "select" + expected.rstrip(";")
+def test_view_snapshot_ctas_does_not_inherit_new_model_layout():
+    sql = MacroRunner(
+        "adapters/relation.sql",
+        "materializations/table/create_table_as.sql",
+        context={
+            "adapter": object.__new__(DorisAdapter),
+            "config": FakeConfig(
+                {
+                    "distributed_by": ["missing_from_old_view"],
+                    "unique_key": ["missing_from_old_view"],
+                    "partition_by": ["missing_from_old_view"],
+                    "properties": {"replication_num": "1"},
+                }
+            ),
+        },
+    ).render(
+        "doris__create_view_snapshot_table",
+        FakeRelation(identifier="backup", relation_type="table"),
+        FakeRelation(identifier="source", relation_type="view"),
+    )
 
-    query = MacroRunner(
+    assert "create table `dbt_test`.`backup`" in sql
+    assert '"replication_num" = "1"' in sql
+    assert '"enable_duplicate_without_keys_by_default" = "true"' in sql
+    assert "as select * from `dbt_test`.`source`;" in sql
+    assert "missing_from_old_view" not in sql
+    assert "distributed by random buckets auto" in sql.lower()
+    assert "distributed by hash" not in sql.lower()
+
+
+def test_view_snapshot_drops_source_only_after_ctas_succeeds():
+    events = []
+
+    class SnapshotAdapter:
+        @staticmethod
+        def quote(identifier):
+            return f"`{identifier}`"
+
+        @staticmethod
+        def cache_added(relation):
+            events.append(("cache_added", relation.identifier))
+
+        @staticmethod
+        def drop_relation(relation):
+            events.append(("drop", relation.identifier))
+
+    def run_query(sql):
+        events.append(("query", " ".join(sql.split())))
+
+    runner = MacroRunner(
+        "adapters/relation.sql",
+        "materializations/table/create_table_as.sql",
+        context={
+            "adapter": SnapshotAdapter(),
+            "config": FakeConfig({"properties": {"replication_num": "1"}}),
+            "load_cached_relation": lambda relation: None,
+            "run_query": run_query,
+        },
+    )
+    runner.render(
+        "doris__snapshot_view_to_table",
+        FakeRelation(identifier="source", relation_type="view"),
+        FakeRelation(identifier="backup", relation_type="table"),
+    )
+
+    assert events[0][0] == "query"
+    assert "as select * from `dbt_test`.`source`" in events[0][1]
+    assert events[1:] == [
+        ("cache_added", "backup"),
+        ("drop", "source"),
+    ]
+
+
+def test_view_data_snapshot_keeps_source_online():
+    events = []
+
+    class SnapshotAdapter:
+        @staticmethod
+        def quote(identifier):
+            return f"`{identifier}`"
+
+        @staticmethod
+        def cache_added(relation):
+            events.append(("cache_added", relation.identifier))
+
+        @staticmethod
+        def drop_relation(relation):
+            events.append(("drop", relation.identifier))
+
+    def run_query(sql):
+        events.append(("query", " ".join(sql.split())))
+
+    runner = MacroRunner(
+        "adapters/relation.sql",
+        "materializations/table/create_table_as.sql",
+        context={
+            "adapter": SnapshotAdapter(),
+            "config": FakeConfig({"properties": {"replication_num": "1"}}),
+            "load_cached_relation": lambda relation: None,
+            "run_query": run_query,
+        },
+    )
+    runner.render(
+        "doris__snapshot_view_data_to_table",
+        FakeRelation(identifier="source", relation_type="view"),
+        FakeRelation(identifier="backup", relation_type="table"),
+    )
+
+    assert events[0][0] == "query"
+    assert "as select * from `dbt_test`.`source`" in events[0][1]
+    assert events[1:] == [("cache_added", "backup")]
+
+
+def test_view_snapshot_ctas_failure_keeps_source_view():
+    dropped = []
+
+    class SnapshotAdapter:
+        @staticmethod
+        def quote(identifier):
+            return f"`{identifier}`"
+
+        @staticmethod
+        def cache_added(relation):
+            raise AssertionError("failed CTAS must not update the cache")
+
+        @staticmethod
+        def drop_relation(relation):
+            dropped.append(relation)
+
+    def fail_ctas(sql):
+        raise RuntimeError("snapshot failed")
+
+    runner = MacroRunner(
+        "adapters/relation.sql",
+        "materializations/table/create_table_as.sql",
+        context={
+            "adapter": SnapshotAdapter(),
+            "load_cached_relation": lambda relation: None,
+            "run_query": fail_ctas,
+        },
+    )
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        runner.render(
+            "doris__snapshot_view_to_table",
+            FakeRelation(identifier="source", relation_type="view"),
+            FakeRelation(identifier="backup", relation_type="table"),
+        )
+
+    assert dropped == []
+
+
+def test_view_snapshot_rejects_same_source_and_destination_without_side_effects():
+    runner = MacroRunner(
+        "adapters/relation.sql",
+        "materializations/table/create_table_as.sql",
+        context={"adapter": object.__new__(DorisAdapter)},
+    )
+
+    with pytest.raises(CapturedCompilerError, match="must be different"):
+        runner.render(
+            "doris__snapshot_view_to_table",
+            FakeRelation(identifier="same", relation_type="view"),
+            FakeRelation(identifier="same", relation_type="table"),
+        )
+
+    assert runner.statements == []
+
+
+def test_view_snapshot_rejects_existing_destination_without_dropping_it():
+    dropped = []
+    existing = FakeRelation(identifier="backup", relation_type="table")
+
+    class SnapshotAdapter:
+        @staticmethod
+        def drop_relation(relation):
+            dropped.append(relation)
+
+    runner = MacroRunner(
+        "adapters/relation.sql",
+        "materializations/table/create_table_as.sql",
+        context={
+            "adapter": SnapshotAdapter(),
+            "load_cached_relation": lambda relation: existing,
+        },
+    )
+
+    with pytest.raises(CapturedCompilerError, match="must not already exist"):
+        runner.render(
+            "doris__snapshot_view_to_table",
+            FakeRelation(identifier="source", relation_type="view"),
+            FakeRelation(identifier="backup", relation_type="table"),
+        )
+
+    assert dropped == []
+    assert runner.statements == []
+
+
+def test_rename_view_is_rejected_before_any_statement():
+    runner = MacroRunner(
         "adapters/relation.sql",
         context={"adapter": object.__new__(DorisAdapter)},
-    ).render(
-        "doris__view_query_from_show_create",
-        show_create_sql,
     )
 
-    assert query == expected
-    assert _doris_view_query_from_show_create(show_create_sql) == expected
+    with pytest.raises(CapturedCompilerError, match="cannot safely rename"):
+        runner.render(
+            "doris__rename_relation",
+            FakeRelation(relation_type="view"),
+            FakeRelation(identifier="backup", relation_type="view"),
+        )
+
+    assert runner.statements == []
 
 
-def test_view_ddl_rewrite_preserves_columns_comments_and_query():
-    show_create_sql = (
-        "CREATE VIEW `events`\n"
-        "(friendly COMMENT 'render AS label')\n"
-        " COMMENT 'view AS comment' AS select 1 AS `friendly`;"
+def test_adapter_rejects_view_rename_before_mutating_cache(monkeypatch):
+    adapter = object.__new__(DorisAdapter)
+    side_effects = []
+    monkeypatch.setattr(
+        adapter,
+        "cache_renamed",
+        lambda *args, **kwargs: side_effects.append("cache"),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "execute_macro",
+        lambda *args, **kwargs: side_effects.append("macro"),
     )
 
-    rewritten = _rewrite_doris_view_ddl(
-        show_create_sql,
-        "`analytics`.`events__dbt_backup`",
-    )
+    with pytest.raises(DbtRuntimeError, match="cannot safely rename a View"):
+        adapter.rename_relation(
+            FakeRelation(relation_type="view"),
+            FakeRelation(identifier="backup", relation_type="view"),
+        )
 
-    assert rewritten == show_create_sql.replace(
-        "`events`",
-        "`analytics`.`events__dbt_backup`",
-        1,
+    assert side_effects == []
+
+
+def test_exchange_views_is_rejected_before_any_statement():
+    runner = MacroRunner(
+        "adapters/relation.sql",
+        context={"adapter": object.__new__(DorisAdapter)},
     )
+    with pytest.raises(CapturedCompilerError, match="cannot safely exchange"):
+        runner.render(
+            "exchange_relation",
+            FakeRelation(identifier="first", relation_type="view"),
+            FakeRelation(identifier="second", relation_type="view"),
+        )
+
+    assert runner.statements == []
 
 
 def test_schema_change_comparison_is_case_insensitive_for_doris_columns():

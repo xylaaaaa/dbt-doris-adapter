@@ -85,8 +85,8 @@ DAILY_SALES_IMMEDIATE_CHANGED_SQL = (
 
 DAILY_SALES_ASYNC_FAILURE_SQL = DAILY_SALES_IMMEDIATE_CHANGED_SQL.replace(
     "sum(amount) + 1 as sales",
-    "sum(if(assert_true(order_id < 0, 'dbt async failure'), amount, 0)) "
-    "as sales",
+    "sum(if(json_parse(if(order_id < 0, '{}', 'DBT_ASYNC_FAILURE')) "
+    "is not null, amount, 0)) as sales",
 )
 
 DAILY_SALES_ON_COMMIT_SQL = DAILY_SALES_MV_SQL.replace(
@@ -222,6 +222,35 @@ group by order_date
 """
 
 
+TYPE_SWITCH_RENAME_FAILURE_MACRO = """
+{% macro doris__rename_relation(from_relation, to_relation) %}
+    {% if (
+        var('fail_intermediate_rename', false)
+        and '__dbt_tmp' in from_relation.identifier
+    ) %}
+        {% do exceptions.raise_compiler_error(
+            'intentional intermediate rename failure'
+        ) %}
+    {% endif %}
+    {% call statement('drop_relation') %}
+        drop {{
+            'materialized view'
+            if to_relation.type == 'materialized_view'
+            else to_relation.type
+        }} if exists {{ to_relation }}
+    {% endcall %}
+    {% call statement('rename_relation') %}
+        {% if to_relation.type == 'materialized_view' %}
+        alter materialized view {{ from_relation }}
+            rename `{{ to_relation.table | replace("`", "``") }}`
+        {% else %}
+        alter table {{ from_relation }} rename {{ to_relation.table }}
+        {% endif %}
+    {% endcall %}
+{% endmacro %}
+"""
+
+
 def mv_info(project, relation, columns="Id, Name, State, RefreshState, QuerySql"):
     return project.run_sql(
         f'select {columns} from mv_infos("database"="{relation.schema}") '
@@ -237,6 +266,16 @@ def relation_type(project, relation):
         relations = adapter.list_relations_without_caching(schema_relation)
     return next(
         item.type for item in relations if item.identifier == relation.identifier
+    )
+
+
+def helper_relations(project, relation):
+    return project.run_sql(
+        "select table_name from information_schema.tables "
+        f"where table_schema = '{relation.schema}' "
+        f"and table_name like '{relation.identifier}__dbt_%' "
+        "order by table_name",
+        fetch="all",
     )
 
 
@@ -412,7 +451,9 @@ class TestDorisMaterializedViewChanges:
             fetch="one",
         )
         assert failed_task[0] == "FAILED"
-        assert "dbt async failure" in failed_task[1]
+        failure_message = failed_task[1].casefold()
+        assert "json" in failure_message
+        assert "parse" in failure_message
 
         set_model_file(project, relation, DAILY_SALES_IMMEDIATE_CHANGED_SQL)
         recovery = run_dbt(["run", "--select", "daily_sales"])
@@ -715,22 +756,94 @@ class TestDorisMaterializedViewTypeSwitch:
             "switchable.sql": SWITCHABLE_TABLE_SQL,
         }
 
+    @pytest.fixture(scope="class")
+    def macros(self):
+        return {
+            "type_switch_rename_failure.sql": (
+                TYPE_SWITCH_RENAME_FAILURE_MACRO
+            ),
+        }
+
     def test_table_materialized_view_view_and_table_switches(self, project):
         run_dbt(["run"])
         relation = relation_from_name(project.adapter, "switchable")
         assert relation_type(project, relation) == RelationType.Table
+        assert project.run_sql(
+            f"select count(*) from {relation}",
+            fetch="one",
+        )[0] == 2
+        assert helper_relations(project, relation) == []
+
+        set_model_file(project, relation, SWITCHABLE_MV_SQL)
+        run_dbt(["run", "--select", "switchable"])
+        relation = relation_from_name(project.adapter, "switchable")
+        assert relation_type(project, relation) == RelationType.MaterializedView
+        assert helper_relations(project, relation) == []
+
+        set_model_file(project, relation, SWITCHABLE_VIEW_SQL)
+        run_dbt(["run", "--select", "switchable"])
+        relation = relation_from_name(project.adapter, "switchable")
+        assert relation_type(project, relation) == RelationType.View
+        assert project.run_sql(
+            f"select count(*) from {relation}",
+            fetch="one",
+        )[0] == 2
+        assert helper_relations(project, relation) == []
 
         set_model_file(project, relation, SWITCHABLE_MV_SQL)
         run_dbt(["run", "--select", "switchable"])
         relation = relation_from_name(project.adapter, "switchable")
         assert relation_type(project, relation) == RelationType.MaterializedView
 
+        # Direct MV -> Table replacement first preserves the old MV under the
+        # backup name. If the following Table rename fails, a retry restores
+        # that MV and can complete the type switch without data loss.
+        set_model_file(project, relation, SWITCHABLE_TABLE_SQL)
+        failure = run_dbt(
+            [
+                "run",
+                "--select",
+                "switchable",
+                "--vars",
+                "{fail_intermediate_rename: true}",
+            ],
+            expect_pass=False,
+        )
+        assert len(failure.results) == 1
+        backup_relation = relation.incorporate(
+            path={"identifier": f"{relation.identifier}__dbt_backup"},
+            type=RelationType.MaterializedView,
+        )
+        assert relation_type(
+            project,
+            backup_relation,
+        ) == RelationType.MaterializedView
+
+        run_dbt(["run", "--select", "switchable"])
+        relation = relation_from_name(project.adapter, "switchable")
+        assert relation_type(project, relation) == RelationType.Table
+        assert project.run_sql(
+            f"select count(*) from {relation}",
+            fetch="one",
+        )[0] == 2
+        assert helper_relations(project, relation) == []
+
         set_model_file(project, relation, SWITCHABLE_VIEW_SQL)
         run_dbt(["run", "--select", "switchable"])
         relation = relation_from_name(project.adapter, "switchable")
         assert relation_type(project, relation) == RelationType.View
+        assert project.run_sql(
+            f"select count(*) from {relation}",
+            fetch="one",
+        )[0] == 2
+        assert helper_relations(project, relation) == []
 
         set_model_file(project, relation, SWITCHABLE_TABLE_SQL)
         run_dbt(["run", "--select", "switchable"])
         relation = relation_from_name(project.adapter, "switchable")
         assert relation_type(project, relation) == RelationType.Table
+        assert project.run_sql(
+            f"select count(*) from {relation}",
+            fetch="one",
+        )[0] == 2
+        assert helper_relations(project, relation) == []

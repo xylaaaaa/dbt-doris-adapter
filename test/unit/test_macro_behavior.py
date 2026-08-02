@@ -697,7 +697,26 @@ class TestIncrementalStrategySql:
             incremental_args(),
         )
         assert "count(*) over" in sql
-        assert "DBT_INTERNAL_DUPLICATE_KEYS" in sql
+        assert "json_parse(if(" in sql
+        assert "'DBT_INTERNAL_DUPLICATE_KEYS'" in sql
+        assert "select DBT_INTERNAL_VALIDATION_MARKER" not in sql
+
+    def test_merge_validation_column_cannot_collide_with_model_columns(self):
+        columns = [
+            FakeColumn("id"),
+            FakeColumn("DBT_INTERNAL_UNIQUE_KEY_VALIDATION_0"),
+            FakeColumn("DBT_INTERNAL_UNIQUE_KEY_VALIDATION_1"),
+        ]
+        sql = self.runner().sql(
+            "doris__get_incremental_merge_sql",
+            incremental_args(dest_columns=columns),
+        )
+
+        assert "as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_2`" in sql
+        assert (
+            "DBT_INTERNAL_SOURCE.`DBT_INTERNAL_UNIQUE_KEY_VALIDATION_2` > 1"
+            in sql
+        )
 
     def test_initial_merge_projects_unique_keys_before_value_columns(self):
         columns = [

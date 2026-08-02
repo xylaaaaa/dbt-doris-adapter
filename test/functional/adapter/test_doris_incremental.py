@@ -33,7 +33,7 @@ import pytest
 from dbt.tests.adapter.incremental.test_incremental_on_schema_change import (
     BaseIncrementalOnSchemaChange,
 )
-from dbt.tests.util import relation_from_name, run_dbt
+from dbt.tests.util import relation_from_name, run_dbt, set_model_file
 
 
 def _run_and_capture_sql(model_name, args=None, expect_pass=True):
@@ -180,15 +180,25 @@ INCREMENTAL_MERGE_SQL = """
 ) }}
 
 {% if is_incremental() %}
-select 1 as id, 'alice_updated' as name, 150 as score
+select 1 as id, 'alice_updated' as name, 150 as score,
+       'updated_0' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_0`,
+       'updated_1' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_1`
 union all
-select 4 as id, 'dave' as name, 400 as score
+select 4 as id, 'dave' as name, 400 as score,
+       'new_0' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_0`,
+       'new_1' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_1`
 {% else %}
-select 1 as id, 'alice' as name, 100 as score
+select 1 as id, 'alice' as name, 100 as score,
+       'initial_0' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_0`,
+       'initial_1' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_1`
 union all
-select 2 as id, 'bob' as name, 200 as score
+select 2 as id, 'bob' as name, 200 as score,
+       'initial_0' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_0`,
+       'initial_1' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_1`
 union all
-select 3 as id, 'charlie' as name, 300 as score
+select 3 as id, 'charlie' as name, 300 as score,
+       'initial_0' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_0`,
+       'initial_1' as `DBT_INTERNAL_UNIQUE_KEY_VALIDATION_1`
 {% endif %}
 """
 
@@ -454,6 +464,25 @@ select 7 as `ASSET_ID`, 'new_table' as value
 """
 
 
+INCREMENTAL_VIEW_NO_BACKSLASH_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    sql_header="set sql_mode='NO_BACKSLASH_ESCAPES'",
+    properties={'replication_num': '1'}
+) }}
+
+select 7 as id, 'new_table' as value
+"""
+
+INCREMENTAL_VIEW_DEFAULT_SQL = INCREMENTAL_VIEW_NO_BACKSLASH_SQL.replace(
+    '    sql_header="set sql_mode=\'NO_BACKSLASH_ESCAPES\'",\n',
+    "",
+)
+
+
 INCREMENTAL_VARCHAR_WIDEN_SQL = """
 {{ config(
     materialized='incremental',
@@ -554,6 +583,66 @@ from dbt_incremental_intentional_missing_relation
 """
 
 
+CREATE_NO_BACKSLASH_RECOVERY_VIEW_MACRO = r"""
+{% macro create_no_backslash_recovery_view(schema_name, view_name) %}
+    {% do run_query("set sql_mode='NO_BACKSLASH_ESCAPES'") %}
+    {% set view_ddl %}
+        create view `{{ schema_name }}`.`{{ view_name }}` as
+        select cast(1.5 as double) as floating_value,
+               99 as id, 'C:\new\path' as value, 7 as `odd"name`
+    {% endset %}
+    {% do run_query(view_ddl) %}
+    {% do run_query("set sql_mode='ONLY_FULL_GROUP_BY'") %}
+{% endmacro %}
+"""
+
+
+VIEW_SNAPSHOT_FAILURE_MACROS = """
+{% macro snapshot_view_for_test(schema_name, view_name, snapshot_name) %}
+    {% set source_relation = api.Relation.create(
+        schema=schema_name,
+        identifier=view_name,
+        type='view'
+    ) %}
+    {% set snapshot_relation = api.Relation.create(
+        schema=schema_name,
+        identifier=snapshot_name,
+        type='table'
+    ) %}
+    {% do doris__snapshot_view_to_table(
+        source_relation,
+        snapshot_relation
+    ) %}
+{% endmacro %}
+
+{% macro doris__rename_relation(from_relation, to_relation) %}
+    {% if (
+        var('fail_intermediate_rename', false)
+        and '__dbt_tmp' in from_relation.identifier
+    ) %}
+        {% do exceptions.raise_compiler_error(
+            'intentional intermediate rename failure'
+        ) %}
+    {% endif %}
+    {% call statement('drop_relation') %}
+        drop {{
+            'materialized view'
+            if to_relation.type == 'materialized_view'
+            else to_relation.type
+        }} if exists {{ to_relation }}
+    {% endcall %}
+    {% call statement('rename_relation') %}
+        {% if to_relation.type == 'materialized_view' %}
+        alter materialized view {{ from_relation }}
+            rename `{{ to_relation.table | replace("`", "``") }}`
+        {% else %}
+        alter table {{ from_relation }} rename {{ to_relation.table }}
+        {% endif %}
+    {% endcall %}
+{% endmacro %}
+"""
+
+
 INCREMENTAL_UNSAFE_OVERWRITE_UNIQUE_SQL = """
 {{ config(
     materialized='incremental',
@@ -648,14 +737,17 @@ class TestDorisIncrementalMerge:
         assert len(results) == 1
 
         rows = project.run_sql(
-            f"select id, name, score from {relation} order by id",
+            "select id, name, score, "
+            "DBT_INTERNAL_UNIQUE_KEY_VALIDATION_0, "
+            "DBT_INTERNAL_UNIQUE_KEY_VALIDATION_1 "
+            f"from {relation} order by id",
             fetch="all",
         )
         assert rows == [
-            (1, "alice_updated", 150),
-            (2, "bob", 200),
-            (3, "charlie", 300),
-            (4, "dave", 400),
+            (1, "alice_updated", 150, "updated_0", "updated_1"),
+            (2, "bob", 200, "initial_0", "initial_1"),
+            (3, "charlie", 300, "initial_0", "initial_1"),
+            (4, "dave", 400, "new_0", "new_1"),
         ]
 
         create_table = project.run_sql(
@@ -671,6 +763,7 @@ class TestDorisIncrementalMerge:
             if "insert into" in statement and "incremental_merge" in statement
         ]
         assert len(direct_inserts) == 1
+        assert "dbt_internal_unique_key_validation_2" in direct_inserts[0]
         _assert_logical_view_staging(statements)
         assert _dbt_helper_relations(project, relation) == []
 
@@ -1377,30 +1470,262 @@ class TestDorisIncrementalBackupRecovery:
     def models(self):
         return {"incremental_recovery.sql": INCREMENTAL_RECOVERY_SQL}
 
-    def test_restores_view_backup_before_a_failed_retry(self, project):
+    @pytest.fixture(scope="class")
+    def macros(self):
+        return {
+            "create_no_backslash_recovery_view.sql": (
+                CREATE_NO_BACKSLASH_RECOVERY_VIEW_MACRO
+            ),
+        }
+
+    def test_keeps_backup_marker_until_a_full_retry_succeeds(self, project):
         relation = relation_from_name(project.adapter, "incremental_recovery")
         backup_name = f"{relation.identifier}__dbt_backup"
-        project.run_sql(
-            f"create view `{relation.schema}`.`{backup_name}` "
-            "(`id` comment 'id AS label', `value`) "
-            "comment 'backup AS metadata' "
-            "as select 99 as id, 'old_definition' as value"
+        operation = run_dbt(
+            [
+                "run-operation",
+                "create_no_backslash_recovery_view",
+                "--args",
+                (
+                    "{schema_name: "
+                    f"{relation.schema}, view_name: {backup_name}"
+                    "}"
+                ),
+            ]
         )
+        assert len(operation) == 1
+        original_backup_rows = project.run_sql(
+            f"select floating_value, id, value "
+            f"from `{relation.schema}`.`{backup_name}`",
+            fetch="all",
+        )
+        assert len(original_backup_rows) == 1
+        assert original_backup_rows[0][:2] == (1.5, 99)
 
         failure = run_dbt(["run"], expect_pass=False)
         assert len(failure.results) == 1
 
+        # The failed recovery run must not publish the old snapshot at the
+        # canonical Table name. Keeping only the backup name makes the next
+        # dbt compilation render the model's full (non-incremental) branch.
+        assert project.run_sql(
+            "select count(*) from information_schema.tables "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{relation.identifier}'",
+            fetch="one",
+        )[0] == 0
         rows = project.run_sql(
-            f"select id, value from {relation}",
+            f"select floating_value, id, value "
+            f"from `{relation.schema}`.`{backup_name}`",
             fetch="all",
         )
-        assert rows == [(99, "old_definition")]
-        restored_ddl = project.run_sql(
-            f"show create view {relation}",
+        assert rows == original_backup_rows
+        backup_type = project.run_sql(
+            "select table_type from information_schema.tables "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{backup_name}'",
             fetch="one",
-        )[1]
-        assert "id AS label" in restored_ddl
-        assert "backup AS metadata" in restored_ddl
+        )[0]
+        assert backup_type == "VIEW"
+
+        project.run_sql(
+            "create table "
+            f"`{relation.schema}`.dbt_incremental_intentional_missing_relation "
+            "(id int, value varchar(20)) "
+            "duplicate key(id) distributed by hash(id) buckets 1 "
+            'properties ("replication_num" = "1")'
+        )
+        project.run_sql(
+            "insert into "
+            f"`{relation.schema}`.dbt_incremental_intentional_missing_relation "
+            "values (7, 'rebuilt')"
+        )
+
+        retry = run_dbt(["run"])
+        assert len(retry) == 1
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [(7, "rebuilt")]
+        create_sql = project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1].lower().replace(" ", "")
+        assert "duplicatekey(`id`)" in create_sql
+        assert "distributedbyhash(`id`)" in create_sql
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalViewNoBackslashMode:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_view_no_backslash.sql": (
+                INCREMENTAL_VIEW_NO_BACKSLASH_SQL
+            ),
+        }
+
+    @pytest.fixture(scope="class")
+    def macros(self):
+        return {
+            "create_no_backslash_recovery_view.sql": (
+                CREATE_NO_BACKSLASH_RECOVERY_VIEW_MACRO
+            ),
+            "view_snapshot_failure_macros.sql": (
+                VIEW_SNAPSHOT_FAILURE_MACROS
+            ),
+        }
+
+    def test_view_replacement_snapshots_under_no_backslash_mode(
+            self,
+            project,
+    ):
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_view_no_backslash",
+        )
+        backup_name = f"{relation.identifier}__dbt_backup"
+
+        # Reverse SQL-mode direction: create the canonical View under
+        # NO_BACKSLASH_ESCAPES, then replace it from a default-mode model. The
+        # injected rename failure leaves the physical snapshot available for
+        # an exact data assertion.
+        created_mode_view = run_dbt(
+            [
+                "run-operation",
+                "create_no_backslash_recovery_view",
+                "--args",
+                (
+                    "{schema_name: "
+                    f"{relation.schema}, view_name: {relation.identifier}"
+                    "}"
+                ),
+            ]
+        )
+        assert len(created_mode_view) == 1
+        reverse_source_rows = project.run_sql(
+            f"select floating_value, id, value, `odd\"name` from {relation}",
+            fetch="all",
+        )
+        assert len(reverse_source_rows) == 1
+        assert reverse_source_rows[0][0:2] == (1.5, 99)
+        assert reverse_source_rows[0][3] == 7
+        set_model_file(project, relation, INCREMENTAL_VIEW_DEFAULT_SQL)
+        reverse_failure, reverse_statements = _run_and_capture_sql(
+            "incremental_view_no_backslash",
+            [
+                "run",
+                "--vars",
+                "{fail_intermediate_rename: true}",
+            ],
+            expect_pass=False,
+        )
+        assert len(reverse_failure.results) == 1
+        assert project.run_sql(
+            f"select floating_value, id, value, `odd\"name` "
+            f"from `{relation.schema}`.`{backup_name}`",
+            fetch="all",
+        ) == reverse_source_rows
+        assert len([
+            statement
+            for statement in reverse_statements
+            if "create table" in statement
+            and backup_name in statement
+            and f"select * from {relation}" in statement
+        ]) == 1
+        assert len(run_dbt(["run"])) == 1
+        assert _dbt_helper_relations(project, relation) == []
+
+        project.run_sql(f"drop table {relation}")
+        set_model_file(project, relation, INCREMENTAL_VIEW_NO_BACKSLASH_SQL)
+
+        # Forward SQL-mode direction: source View uses the default mode while
+        # the replacement model runs with NO_BACKSLASH_ESCAPES.
+        project.run_sql(
+            f"create view {relation} as "
+            "select cast(1.5 as double) as floating_value, "
+            "99 as id, 'C:\\new\\path' as value"
+        )
+        source_rows = project.run_sql(
+            f"select floating_value, id, value from {relation}",
+            fetch="all",
+        )
+
+        # Exercise a real Doris CTAS failure. The helper must leave its source
+        # View intact and queryable when the snapshot table cannot be created.
+        invalid_snapshot_name = "x" * 65
+        failed_snapshot = run_dbt(
+            [
+                "run-operation",
+                "snapshot_view_for_test",
+                "--args",
+                (
+                    "{schema_name: "
+                    f"{relation.schema}, view_name: {relation.identifier}, "
+                    f"snapshot_name: {invalid_snapshot_name}"
+                    "}"
+                ),
+            ],
+            expect_pass=False,
+        )
+        assert len(failed_snapshot.results) == 1
+        assert project.run_sql(
+            f"select floating_value, id, value from {relation}",
+            fetch="all",
+        ) == source_rows
+
+        project.run_sql(
+            f"create view `{relation.schema}`.`{backup_name}` as "
+            "select -1 as id, 'stale_backup' as value"
+        )
+
+        failure, statements = _run_and_capture_sql(
+            "incremental_view_no_backslash",
+            [
+                "run",
+                "--vars",
+                "{fail_intermediate_rename: true}",
+            ],
+            expect_pass=False,
+        )
+        assert len(failure.results) == 1
+        assert project.run_sql(
+            "select table_type from information_schema.tables "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{backup_name}'",
+            fetch="one",
+        )[0] == "BASE TABLE"
+        assert project.run_sql(
+            f"select floating_value, id, value "
+            f"from `{relation.schema}`.`{backup_name}`",
+            fetch="all",
+        ) == source_rows
+        snapshot_ctas = [
+            statement
+            for statement in statements
+            if "create table" in statement
+            and backup_name in statement
+            and f"select * from {relation}" in statement
+        ]
+        assert len(snapshot_ctas) == 1
+        sql_header_indexes = [
+            index
+            for index, statement in enumerate(statements)
+            if "set sql_mode='no_backslash_escapes'" in statement
+        ]
+        assert len(sql_header_indexes) == 1
+        assert statements.index(snapshot_ctas[0]) < sql_header_indexes[0]
+        assert _target_dml_statements(statements) == []
+
+        # A retry keeps the physical backup marker in place while it builds the
+        # canonical target from scratch; it must not treat the old snapshot as
+        # an incremental target.
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [(7, "new_table")]
         assert _dbt_helper_relations(project, relation) == []
 
 

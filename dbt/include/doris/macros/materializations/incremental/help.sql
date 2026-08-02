@@ -202,13 +202,17 @@ cannot mutate these physical columns during an incremental run; use
 
 {#
     Make duplicate source keys fail inside the same statement as a direct Unique
-    Key upsert. The source is consumed once by a windowed derived table. A
-    correlated scalar subquery maps every duplicate count to two constant rows,
-    which Doris rejects before publishing the INSERT.
+    Key upsert. The source is consumed once by a windowed derived table. For a
+    duplicate row, json_parse receives a deliberately invalid sentinel and
+    cancels the DML before Doris publishes it. Valid rows parse an empty JSON
+    object, so the predicate remains true.
 
-    Do not rewrite this as two consumers of a CTE: Doris 2.1 may inline both
-    consumers, evaluating volatile model SQL twice and validating a different
-    batch from the one inserted.
+    Doris 2.1 restricts correlated scalar subqueries in binary predicates, so
+    this must not use a multi-row scalar-subquery guard. Do not rewrite it as two
+    consumers of a CTE either: Doris may inline both consumers, evaluating
+    volatile model SQL twice and validating a different batch from the one
+    inserted. The window-result alias is selected from n + 1 reserved candidates
+    so it cannot collide with any of the n model columns.
 #}
 {% macro doris__validated_unique_source_select(arg_dict) %}
     {% set unique_key = doris__normalize_unique_key(arg_dict['unique_key']) %}
@@ -218,6 +222,18 @@ cannot mutate these physical columns during an incremental run; use
         source_sql is none
     ) %}
     {% set dest_columns = arg_dict['dest_columns'] %}
+    {% set dest_column_names = [] %}
+    {% for column in dest_columns %}
+        {% do dest_column_names.append(column.name | lower) %}
+    {% endfor %}
+    {# There are n destination names and n + 1 candidates, so one is free. #}
+    {% set validation = namespace(column=none) %}
+    {% for candidate_index in range((dest_columns | length) + 1) %}
+        {% set candidate = 'DBT_INTERNAL_UNIQUE_KEY_VALIDATION_' ~ candidate_index %}
+        {% if validation.column is none and candidate | lower not in dest_column_names %}
+            {% set validation.column = candidate %}
+        {% endif %}
+    {% endfor %}
 
     select
         {% for column in dest_columns -%}
@@ -237,7 +253,7 @@ cannot mutate these physical columns during an incremental run; use
                 ) > 1,
                 2,
                 1
-            ) as DBT_INTERNAL_UNIQUE_KEY_VALIDATION
+            ) as {{ adapter.quote(validation.column) }}
         from (
             {% if temp_relation_exists %}
             select * from {{ arg_dict['temp_relation'] }}
@@ -246,18 +262,11 @@ cannot mutate these physical columns during an incremental run; use
             {% endif %}
         ) DBT_INTERNAL_RAW_SOURCE
     ) DBT_INTERNAL_SOURCE
-    where (
-        select DBT_INTERNAL_VALIDATION_MARKER
-        from (
-            select 1 as DBT_INTERNAL_VALIDATION_MARKER
-            union all
-            select 2 as DBT_INTERNAL_VALIDATION_MARKER
-            union all
-            select 2 as DBT_INTERNAL_VALIDATION_MARKER
-        ) DBT_INTERNAL_DUPLICATE_KEYS
-        where DBT_INTERNAL_DUPLICATE_KEYS.DBT_INTERNAL_VALIDATION_MARKER
-            = DBT_INTERNAL_SOURCE.DBT_INTERNAL_UNIQUE_KEY_VALIDATION
-    ) = 1
+    where json_parse(if(
+        DBT_INTERNAL_SOURCE.{{ adapter.quote(validation.column) }} > 1,
+        'DBT_INTERNAL_DUPLICATE_KEYS',
+        '{}'
+    )) is not null
 {% endmacro %}
 
 

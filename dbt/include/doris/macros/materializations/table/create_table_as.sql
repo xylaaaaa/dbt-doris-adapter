@@ -166,6 +166,55 @@
 
 
 {#--
+    Freeze a View as a recovery Table without replaying its stored SQL text.
+
+    Callers evaluate the source before the replacement model changes the
+    session because Doris 2.1 can apply the current SQL mode while reading a
+    View. Do not inherit the new model's key, distribution, partition, or
+    contract configuration: the old View may not contain those columns. Use a
+    keyless Duplicate model and random distribution so non-keyable first
+    columns remain valid snapshot data.
+--#}
+{% macro doris__create_view_snapshot_table(relation, source_relation) -%}
+    {% set configured_properties = config.get(
+        'properties',
+        validator=validation.any[dict]
+    ) %}
+    {% set replication_num = config.get('replication_num') %}
+    {% if replication_num is none and configured_properties %}
+        {% set replication_num = configured_properties.get('replication_num') %}
+    {% endif %}
+    {% set replication_allocation = none %}
+    {% if replication_num is none and configured_properties %}
+        {% set replication_allocation = configured_properties.get(
+            'replication_allocation'
+        ) %}
+    {% endif %}
+    {% set snapshot_properties = {
+        'enable_duplicate_without_keys_by_default': 'true'
+    } %}
+    {% if replication_num is not none %}
+        {% do snapshot_properties.update({
+            'replication_num': replication_num
+        }) %}
+    {% elif replication_allocation is not none %}
+        {% do snapshot_properties.update({
+            'replication_allocation': replication_allocation
+        }) %}
+    {% endif %}
+
+    create table {{ relation.include(database=False) }}
+    distributed by random buckets auto
+    properties (
+        {% for key, value in snapshot_properties.items() %}
+        "{{ key }}" = "{{ value }}"{% if not loop.last %},{% endif %}
+        {% endfor %}
+    )
+    as select * from {{ source_relation }};
+{%- endmacro %}
+
+
+{#--
     Wrap the model SQL so that declared column types are applied via CAST.
 
     This projection lists columns explicitly, so it may only be used when dbt

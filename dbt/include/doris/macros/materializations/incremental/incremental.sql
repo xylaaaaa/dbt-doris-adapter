@@ -20,27 +20,23 @@
   {% set existing_relation = load_cached_relation(this) %}
   {% set temp_relation = make_temp_relation(target_relation) %}
   {% set intermediate_relation = make_intermediate_relation(target_relation) %}
-  {# A failed view -> table replacement can leave the old object at dbt's
-     backup name while the canonical target is absent. Restore it before stale
-     helper cleanup, so a retry can never delete the only good copy. #}
+  {% set recovered_from_backup = false %}
+  {# A failed type replacement can leave the old object at dbt's backup name
+     while the canonical target is absent. Keep that durable recovery marker
+     in place until a complete target build succeeds. Moving it back to the
+     canonical name before the model succeeds would make the next invocation's
+     is_incremental() return true after another failure. #}
   {% set recovery_backup_relation = load_cached_relation(
       make_backup_relation(target_relation, 'table')
   ) %}
   {% if existing_relation is none and recovery_backup_relation is not none %}
-      {% set recovery_target_relation = target_relation.incorporate(
-          type=recovery_backup_relation.type
-      ) %}
-      {% do adapter.rename_relation(
-          recovery_backup_relation,
-          recovery_target_relation
-      ) %}
-      {% set existing_relation = load_cached_relation(
-          recovery_target_relation
-      ) %}
+      {% set recovered_from_backup = true %}
   {% endif %}
 
   {% set backup_relation_type = (
-      'table' if existing_relation is none else existing_relation.type
+      'table'
+      if existing_relation is none or existing_relation.is_view
+      else existing_relation.type
   ) %}
   {% set backup_relation = make_backup_relation(
       target_relation,
@@ -61,6 +57,7 @@
   ) %}
   {% set full_refresh_mode = (
       should_full_refresh()
+      or recovered_from_backup
       or (existing_relation is not none and existing_relation.type != 'table')
   ) %}
   {% set on_schema_change = incremental_validate_on_schema_change(
@@ -78,7 +75,11 @@
   {% set preexisting_intermediate_relation = load_cached_relation(
       intermediate_relation
   ) %}
-  {% set preexisting_backup_relation = load_cached_relation(backup_relation) %}
+  {% set preexisting_backup_relation = (
+      none
+      if recovered_from_backup
+      else load_cached_relation(backup_relation)
+  ) %}
   {{ drop_relation_if_exists(preexisting_temp_relation) }}
   {{ drop_relation_if_exists(preexisting_intermediate_relation) }}
   {{ drop_relation_if_exists(preexisting_backup_relation) }}
@@ -91,6 +92,16 @@
       ) %}
   {% endif %}
 
+  {# Snapshot an active View before this model's hooks or sql_header can alter
+     the session used to evaluate it. Keep the View online until the physical
+     replacement has been built successfully. #}
+  {% if existing_relation is not none and existing_relation.is_view %}
+      {% do doris__snapshot_view_data_to_table(
+          existing_relation,
+          backup_relation
+      ) %}
+  {% endif %}
+
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
@@ -99,6 +110,9 @@
   {% do doris__preflight_grants(target_relation, grant_config) %}
 
   {% set to_drop = [] %}
+  {% if recovered_from_backup %}
+      {% do to_drop.append(recovery_backup_relation) %}
+  {% endif %}
   {% set need_swap = false %}
   {% set sql_header = config.get('sql_header', none) %}
   {# Execute the header once, before metadata inspection and model SQL. Embedding
@@ -283,6 +297,15 @@
               false
           ) %}
           {% do to_drop.append(intermediate_relation) %}
+      {% elif existing_relation.is_view %}
+          {# The recovery snapshot already exists, and the old View remained
+             online while the replacement was built. #}
+          {% do adapter.drop_relation(existing_relation) %}
+          {% do adapter.rename_relation(
+              intermediate_relation,
+              target_relation
+          ) %}
+          {% do to_drop.append(backup_relation) %}
       {% else %}
           {% do adapter.rename_relation(existing_relation, backup_relation) %}
           {% do adapter.rename_relation(intermediate_relation, target_relation) %}

@@ -931,9 +931,13 @@
 {% materialization materialized_view, adapter='doris' %}
     {%- set existing_relation = load_cached_relation(this) -%}
     {%- set target_relation = this.incorporate(type='materialized_view') -%}
+    {%- set backup_relation_type = 'table' -%}
+    {%- if existing_relation is not none and not existing_relation.is_view -%}
+        {%- set backup_relation_type = existing_relation.type -%}
+    {%- endif -%}
     {%- set backup_relation = target_relation.incorporate(
         path={'identifier': target_relation.identifier ~ '__dbt_backup'},
-        type=existing_relation.type if existing_relation is not none else 'table'
+        type=backup_relation_type
     ) -%}
     {%- set preexisting_backup_relation = load_cached_relation(
         backup_relation
@@ -942,13 +946,22 @@
         existing_relation is none
         and preexisting_backup_relation is not none
     ) -%}
-        {%- set restored_relation = this.incorporate(
-            type=preexisting_backup_relation.type
-        ) -%}
-        {% do adapter.rename_relation(
-            preexisting_backup_relation,
-            restored_relation
-        ) %}
+        {%- set restored_relation = this.incorporate(type=(
+            'table'
+            if preexisting_backup_relation.is_view
+            else preexisting_backup_relation.type
+        )) -%}
+        {% if preexisting_backup_relation.is_view %}
+            {% do doris__snapshot_view_to_table(
+                preexisting_backup_relation,
+                restored_relation
+            ) %}
+        {% else %}
+            {% do adapter.rename_relation(
+                preexisting_backup_relation,
+                restored_relation
+            ) %}
+        {% endif %}
         {%- set existing_relation = restored_relation -%}
         {%- set preexisting_backup_relation = none -%}
     {%- endif -%}
@@ -967,6 +980,20 @@
     {%- set grant_config = config.get('grants') -%}
     {%- set backup_relation_to_drop = none -%}
     {%- set refresh_task = none -%}
+
+    {# Snapshot an active View before this model's pre-hooks or sql_header can
+         alter the session used to evaluate it. Keep the source View online
+         until the replacement Materialized View is ready to publish. #}
+    {%- if existing_relation is not none and existing_relation.is_view -%}
+        {%- if preexisting_backup_relation is not none -%}
+            {% do adapter.drop_relation(preexisting_backup_relation) %}
+            {%- set preexisting_backup_relation = none -%}
+        {%- endif -%}
+        {% do doris__snapshot_view_data_to_table(
+            existing_relation,
+            backup_relation
+        ) %}
+    {%- endif -%}
 
     {{ run_hooks(pre_hooks, inside_transaction=false) }}
     {%- if execute -%}
@@ -1089,12 +1116,20 @@
                 {% endcall %}
             {%- elif action == 'replace_type' -%}
                 {%- set current_backup_relation = backup_relation.incorporate(
-                    type=existing_relation.type
+                    type=(
+                        'table'
+                        if existing_relation.is_view
+                        else existing_relation.type
+                    )
                 ) -%}
-                {% do adapter.rename_relation(
-                    existing_relation,
-                    current_backup_relation
-                ) %}
+                {% if existing_relation.is_view %}
+                    {% do adapter.drop_relation(existing_relation) %}
+                {% else %}
+                    {% do adapter.rename_relation(
+                        existing_relation,
+                        current_backup_relation
+                    ) %}
+                {% endif %}
                 {% do adapter.rename_relation(
                     intermediate_relation,
                     target_relation

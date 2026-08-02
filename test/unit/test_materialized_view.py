@@ -36,7 +36,10 @@ from dbt.adapters.doris.relation import DorisRelation
 
 from .macro_harness import CapturedCompilerError, FakeConfig, FakeRelation, MacroRunner
 
-MATERIALIZED_VIEW_MACROS = ("materializations/materialized_view/materialized_view.sql",)
+MATERIALIZED_VIEW_MACROS = (
+    "materializations/materialized_view/materialized_view.sql",
+    "materializations/table/create_table_as.sql",
+)
 
 
 def materialized_view_runner(config=None, model=None):
@@ -81,6 +84,10 @@ def materialization_runner(
 
         def rename_relation(self, from_relation, to_relation):
             self.events.append(("rename", from_relation, to_relation))
+
+        @staticmethod
+        def cache_added(relation):
+            return None
 
         def commit(self):
             self.events.append(("commit",))
@@ -141,6 +148,12 @@ def materialization_runner(
             return SimpleNamespace(rows=[rows])
         if normalized_sql.startswith("select sleep("):
             return SimpleNamespace(rows=[[0]])
+        if (
+            normalized_sql.startswith("create table")
+            and "__dbt_backup" in normalized_sql
+            and " as select * from " in normalized_sql
+        ):
+            return None
         raise AssertionError(f"Unexpected run_query SQL: {sql}")
 
     def run_hooks(hooks, inside_transaction):
@@ -1170,20 +1183,36 @@ def test_materialization_replaces_a_different_relation_type(existing_type):
         "mark_materialized_view_deployment_complete",
         "drop_relation",
     ]
-    assert [event[0] for event in adapter.events] == [
-        "rename",
-        "rename",
-        "commit",
-        "drop",
-    ]
-    assert adapter.events[0][1] == existing
-    assert adapter.events[0][2].identifier == "my_model__dbt_backup"
-    assert adapter.events[1][1].identifier == "my_model__dbt_tmp"
-    assert adapter.events[1][2].identifier == "my_model"
+    if existing_type == "view":
+        assert [event[0] for event in adapter.events] == [
+            "drop",
+            "rename",
+            "commit",
+            "drop",
+        ]
+        assert adapter.events[0][1] == existing
+        assert adapter.events[1][1].identifier == "my_model__dbt_tmp"
+        assert adapter.events[1][2].identifier == "my_model"
+        assert any(
+            "create table `dbt_test`.`my_model__dbt_backup`" in query.lower()
+            and "as select * from `dbt_test`.`my_model`" in query.lower()
+            for query in runner.run_queries
+        )
+    else:
+        assert [event[0] for event in adapter.events] == [
+            "rename",
+            "rename",
+            "commit",
+            "drop",
+        ]
+        assert adapter.events[0][1] == existing
+        assert adapter.events[0][2].identifier == "my_model__dbt_backup"
+        assert adapter.events[1][1].identifier == "my_model__dbt_tmp"
+        assert adapter.events[1][2].identifier == "my_model"
     assert raw_results[0]["code"] == "CREATE MATERIALIZED VIEW"
 
 
-def test_table_materialization_does_not_exchange_with_an_existing_mv():
+def test_table_materialization_preserves_existing_mv_until_table_is_ready():
     events = []
     existing = FakeRelation(relation_type="materialized_view")
 
@@ -1205,7 +1234,7 @@ def test_table_materialization_does_not_exchange_with_an_existing_mv():
             events.append(("commit",))
 
     def load_cached_relation(relation):
-        if relation.identifier.endswith("__dbt_tmp"):
+        if relation.identifier.endswith(("__dbt_tmp", "__dbt_backup")):
             return None
         return existing
 
@@ -1227,6 +1256,12 @@ def test_table_materialization_does_not_exchange_with_an_existing_mv():
             "get_assert_columns_equivalent": lambda sql: "",
             "get_table_columns_and_constraints": lambda: "`id` int",
             "load_cached_relation": load_cached_relation,
+            "make_backup_relation": lambda relation, relation_type: (
+                relation.incorporate(
+                    path={"identifier": relation.identifier + "__dbt_backup"},
+                    type=relation_type,
+                )
+            ),
             "make_intermediate_relation": lambda relation: relation.incorporate(
                 path={"identifier": relation.identifier + "__dbt_tmp"}
             ),
@@ -1242,7 +1277,18 @@ def test_table_materialization_does_not_exchange_with_an_existing_mv():
 
     runner.render("materialization_table_doris")
 
-    assert [event[0] for event in events] == ["drop", "rename", "commit"]
+    assert [event[0] for event in events] == [
+        "rename",
+        "rename",
+        "commit",
+        "drop",
+        "drop",
+    ]
+    assert events[0][1] is existing
+    assert events[0][2].identifier == "my_model__dbt_backup"
+    assert events[0][2].type == "materialized_view"
+    assert events[1][1].identifier == "my_model__dbt_tmp"
+    assert events[1][2].identifier == "my_model"
 
 
 def test_view_materialization_drops_an_existing_mv_through_the_adapter():
