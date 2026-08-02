@@ -93,7 +93,9 @@ the legacy combination `insert_overwrite + unique_key` is rejected: change the
 strategy to `merge` for upserts, or remove `unique_key` to explicitly opt in to
 native overwrite, which can remove rows absent from the new batch. See the
 [Chinese incremental guide](https://github.com/xylaaaaa/dbt-doris-adapter/blob/main/docs/incremental.zh-CN.md)
-for configuration and migration details.
+for configuration and migration details, and the
+[Incremental test plan](https://github.com/xylaaaaa/dbt-doris-adapter/blob/main/docs/incremental-test-plan.zh-CN.md)
+for SQL-count and failure-recovery acceptance criteria.
 
 ### Asynchronous materialized views
 

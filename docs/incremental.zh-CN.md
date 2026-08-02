@@ -1,5 +1,8 @@
 # dbt-doris Incremental 指南
 
+发布验证、SQL 次数判定和失败注入清单见
+[Incremental 测试方案](incremental-test-plan.zh-CN.md)。
+
 dbt-doris 内置支持三种 Incremental 策略：`append`、`merge` 和
 `insert_overwrite`。已有目标表且 `on_schema_change='ignore'` 时，这三种
 策略都只执行一条最终 DML，不会先把同一批数据写入物理临时表。

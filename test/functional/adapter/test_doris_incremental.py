@@ -27,6 +27,8 @@ Tests for Doris incremental materialization:
 - full refresh replaces the target and preserves its Doris table configuration
 """
 
+import re
+
 import pytest
 from dbt.tests.adapter.incremental.test_incremental_on_schema_change import (
     BaseIncrementalOnSchemaChange,
@@ -59,9 +61,72 @@ def _assert_no_physical_dbt_staging(statements):
     physical_staging_statements = [
         statement
         for statement in statements
-        if "__dbt_tmp" in statement and "create table" in statement
+        if (
+            "__dbt_tmp" in statement
+            and "create table" in statement
+        )
+        or re.search(
+            r"\binsert\s+(?:into|overwrite\s+table)\s+"
+            r"(?:`[^`]+`\.)*`[^`]*__dbt_tmp`",
+            statement,
+        )
     ]
     assert physical_staging_statements == []
+
+
+def _target_dml_statements(statements):
+    return [
+        statement
+        for statement in statements
+        if re.search(
+            r"\binsert\s+(?:into|overwrite\s+table)\s+",
+            statement,
+        )
+    ]
+
+
+def _assert_logical_view_staging(statements):
+    logical_views = [
+        statement
+        for statement in statements
+        if "create or replace view" in statement and "__dbt_tmp" in statement
+    ]
+    assert len(logical_views) == 1
+    _assert_no_physical_dbt_staging(statements)
+
+    target_dml = _target_dml_statements(statements)
+    assert len(target_dml) == 1
+    assert "__dbt_tmp" in target_dml[0]
+
+
+def _assert_direct_initial_ctas(statements, model_name):
+    target_ctas = [
+        statement
+        for statement in statements
+        if "create table" in statement
+        and model_name in statement
+        and "__dbt_" not in statement
+        and " as " in statement
+    ]
+    assert len(target_ctas) == 1
+    assert not any("create or replace view" in statement for statement in statements)
+    _assert_no_physical_dbt_staging(statements)
+    assert _target_dml_statements(statements) == []
+
+
+def _assert_physical_staging(statements):
+    staging_ctas = [
+        statement
+        for statement in statements
+        if "create table" in statement
+        and "__dbt_tmp" in statement
+        and " as " in statement
+    ]
+    assert len(staging_ctas) == 1
+
+    target_dml = _target_dml_statements(statements)
+    assert len(target_dml) == 1
+    assert "__dbt_tmp" in target_dml[0]
 
 
 def _dbt_helper_relations(project, relation):
@@ -434,6 +499,47 @@ select cast(2 as int) as `ID`, cast('new' as varchar(20)) as `VALUE`
 """
 
 
+INCREMENTAL_CUSTOM_STRATEGY_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='frozen_append',
+    incremental_predicates=['DBT_CUSTOM_SOURCE.`id` >= 0'],
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'}
+) }}
+
+{% if is_incremental() %}
+select 2 as id, 'incremental' as value
+{% else %}
+select 1 as id, 'initial' as value
+{% endif %}
+"""
+
+
+INCREMENTAL_CUSTOM_STRATEGY_MACRO = """
+{% macro get_incremental_frozen_append_sql(arg_dict) %}
+    {% set target_relation = arg_dict['target_relation'] %}
+    {% set temp_relation = arg_dict['temp_relation'] %}
+    {% set unique_key = arg_dict['unique_key'] %}
+    {% set dest_columns = arg_dict['dest_columns'] %}
+    {% set incremental_predicates = arg_dict['incremental_predicates'] %}
+    insert into {{ target_relation }}
+        ({% for column in dest_columns -%}
+            {{ adapter.quote(column.name) }}{% if not loop.last %}, {% endif %}
+        {%- endfor %})
+    select
+        {% for column in dest_columns -%}
+            DBT_CUSTOM_SOURCE.{{ adapter.quote(column.name) }}{% if not loop.last %}, {% endif %}
+        {%- endfor %}
+    from {{ temp_relation }} DBT_CUSTOM_SOURCE
+    {% if incremental_predicates %}
+    where {{ incremental_predicates | join(' and ') }}
+    {% endif %}
+{% endmacro %}
+"""
+
+
 INCREMENTAL_RECOVERY_SQL = """
 {{ config(
     materialized='incremental',
@@ -481,8 +587,14 @@ class TestDorisIncrementalAppend:
         return {"incremental_append.sql": INCREMENTAL_APPEND_SQL}
 
     def test_incremental_append(self, project):
-        results = run_dbt(["run"])
+        results, initial_statements = _run_and_capture_sql(
+            "incremental_append"
+        )
         assert len(results) == 1
+        _assert_direct_initial_ctas(
+            initial_statements,
+            "incremental_append",
+        )
 
         relation = relation_from_name(project.adapter, "incremental_append")
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
@@ -509,7 +621,7 @@ class TestDorisIncrementalAppend:
             if "insert into" in statement and "incremental_append" in statement
         ]
         assert len(direct_inserts) == 1
-        _assert_no_physical_dbt_staging(statements)
+        _assert_logical_view_staging(statements)
         assert _dbt_helper_relations(project, relation) == []
 
 
@@ -519,8 +631,14 @@ class TestDorisIncrementalMerge:
         return {"incremental_merge.sql": INCREMENTAL_MERGE_SQL}
 
     def test_merge_upserts_without_staging(self, project):
-        results = run_dbt(["run"])
+        results, initial_statements = _run_and_capture_sql(
+            "incremental_merge"
+        )
         assert len(results) == 1
+        _assert_direct_initial_ctas(
+            initial_statements,
+            "incremental_merge",
+        )
 
         relation = relation_from_name(project.adapter, "incremental_merge")
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
@@ -553,7 +671,7 @@ class TestDorisIncrementalMerge:
             if "insert into" in statement and "incremental_merge" in statement
         ]
         assert len(direct_inserts) == 1
-        _assert_no_physical_dbt_staging(statements)
+        _assert_logical_view_staging(statements)
         assert _dbt_helper_relations(project, relation) == []
 
 
@@ -854,8 +972,14 @@ class TestDorisIncrementalInsertOverwrite:
         return {"incremental_overwrite.sql": INCREMENTAL_OVERWRITE_SQL}
 
     def test_whole_table_insert_overwrite_removes_old_rows(self, project):
-        results = run_dbt(["run"])
+        results, initial_statements = _run_and_capture_sql(
+            "incremental_overwrite"
+        )
         assert len(results) == 1
+        _assert_direct_initial_ctas(
+            initial_statements,
+            "incremental_overwrite",
+        )
 
         relation = relation_from_name(project.adapter, "incremental_overwrite")
         result = project.run_sql(f"select count(*) from {relation}", fetch="one")
@@ -879,7 +1003,7 @@ class TestDorisIncrementalInsertOverwrite:
             if "insert overwrite" in statement and "incremental_overwrite" in statement
         ]
         assert len(overwrite_statements) == 1
-        _assert_no_physical_dbt_staging(statements)
+        _assert_logical_view_staging(statements)
         assert _dbt_helper_relations(project, relation) == []
 
 
@@ -1071,7 +1195,11 @@ class TestDorisIncrementalCaseOnlySchemaChange:
         )
         project.run_sql(f"insert into {relation} values (1, 'original')")
 
-        assert len(run_dbt(["run"])) == 1
+        results, statements = _run_and_capture_sql(
+            "incremental_case_only_schema"
+        )
+        assert len(results) == 1
+        _assert_physical_staging(statements)
         assert project.run_sql(
             f"select id, value from {relation} order by id",
             fetch="all",
@@ -1084,6 +1212,60 @@ class TestDorisIncrementalCaseOnlySchemaChange:
             fetch="all",
         )
         assert columns == [("id",), ("value",)]
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalCustomStrategy:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incremental_custom_strategy.sql": (
+                INCREMENTAL_CUSTOM_STRATEGY_SQL
+            ),
+        }
+
+    @pytest.fixture(scope="class")
+    def macros(self):
+        return {
+            "incremental_custom_strategy.sql": (
+                INCREMENTAL_CUSTOM_STRATEGY_MACRO
+            ),
+        }
+
+    def test_custom_strategy_uses_frozen_physical_staging(self, project):
+        assert len(run_dbt(["run"])) == 1
+
+        results, statements = _run_and_capture_sql(
+            "incremental_custom_strategy"
+        )
+        assert len(results) == 1
+        _assert_physical_staging(statements)
+        assert not any(
+            "create or replace view" in statement
+            for statement in statements
+        )
+        staging_ctas = next(
+            statement
+            for statement in statements
+            if "create table" in statement
+            and "__dbt_tmp" in statement
+            and " as " in statement
+        )
+        compact_staging_ctas = staging_ctas.replace(" ", "")
+        assert "distributedbyhash(`id`)" in compact_staging_ctas
+        assert 'properties("replication_num"="1")' in compact_staging_ctas
+
+        target_dml = _target_dml_statements(statements)[0]
+        assert "dbt_custom_source.`id` >= 0" in target_dml
+
+        relation = relation_from_name(
+            project.adapter,
+            "incremental_custom_strategy",
+        )
+        assert project.run_sql(
+            f"select id, value from {relation} order by id",
+            fetch="all",
+        ) == [(1, "initial"), (2, "incremental")]
         assert _dbt_helper_relations(project, relation) == []
 
 
@@ -1125,8 +1307,24 @@ class TestDorisIncrementalFullRefresh:
         # Full refresh intentionally builds an intermediate table before the
         # atomic REPLACE WITH TABLE. The no-staging rule applies to ordinary
         # incremental DML, not to safe full-refresh replacement.
-        assert any(
-            "create table" in statement and "incremental_fr__dbt_tmp" in statement
+        intermediate_ctas = [
+            statement
+            for statement in statements
+            if "create table" in statement
+            and "incremental_fr__dbt_tmp" in statement
+            and " as " in statement
+        ]
+        assert len(intermediate_ctas) == 1
+        assert _target_dml_statements(statements) == []
+        exchanges = [
+            statement
+            for statement in statements
+            if "replace with table" in statement
+            and "incremental_fr__dbt_tmp" in statement
+        ]
+        assert len(exchanges) == 1
+        assert not any(
+            "create or replace view" in statement
             for statement in statements
         )
         assert _dbt_helper_relations(project, relation) == []

@@ -28,11 +28,11 @@
         order by ordinal_position
     {% endcall %}
     {% set table = load_result('get_columns_in_relation').table %}
-    {{ return(sql_convert_columns_in_relation(table)) }}
+    {{ return(doris__sql_convert_columns_in_relation(table)) }}
 {%- endmacro %}
 
 
-{% macro sql_convert_columns_in_relation(table) -%}
+{% macro doris__sql_convert_columns_in_relation(table) -%}
     {% set columns = [] %}
     {% for row in table %}
         {% set col_name = row['column'] %}
@@ -66,6 +66,11 @@
         {% endif %}
     {% endfor %}
     {{ return(columns) }}
+{%- endmacro %}
+
+
+{% macro sql_convert_columns_in_relation(table) -%}
+    {{ return(doris__sql_convert_columns_in_relation(table)) }}
 {%- endmacro %}
 
 
