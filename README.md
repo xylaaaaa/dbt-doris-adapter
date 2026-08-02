@@ -11,12 +11,85 @@ dbt Labs release.
 
 | Component | Development or test baseline |
 | --- | --- |
-| dbt Core | 1.12.x |
-| Doris Incremental live-cluster E2E | 4.1.2-rc01 (`doris-4.1.2-rc01-4536b29f712`) |
-| Doris Async MV live-cluster E2E | 4.1.2-rc01 (`doris-4.1.2-rc01-4536b29f712`) |
+| dbt Core | 1.12.x; final matrix ran on 1.12.0 |
+| Doris release E2E matrix | 2.1.11, 3.0.8, 3.1.4, 4.0.7, and 4.1.3 all passed on the final CTAS-snapshot, durable-marker, and pre-model-ordering implementation |
+| Historical mixed-cluster Functional run | FE `doris-4.1.2-rc01-4536b29f712`; BE `doris-0.0.0-0a5ad292e3f`; 87 passed, but not official-release compatibility evidence |
 | Doris Async MV gate unit tests | Mocked version strings for 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 |
-| Python | 3.10 or newer |
+| Python | 3.10 or newer; final matrix ran on 3.12.13 |
 | Database protocol | Doris MySQL protocol |
+
+The release-candidate E2E matrix is deliberately pinned to exact public
+artifacts:
+
+| Doris release | Exact FE/BE Version | Complete Functional | Focused Incremental | State |
+| --- | --- | --- | --- | --- |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 88 passed, 106 warnings, 96.64s | 26 passed, 27 warnings, 21.49s | Passed |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 88 passed, 106 warnings, 96.59s | 26 passed, 27 warnings, 21.79s | Passed |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 88 passed, 106 warnings, 99.73s | 26 passed, 27 warnings, 22.46s | Passed |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 88 passed, 106 warnings, 99.05s | 26 passed, 27 warnings, 22.26s | Passed |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 88 passed, 106 warnings, 99.16s | 26 passed, 27 warnings, 22.79s | Passed |
+
+Here, `Passed` means that the exact release completed the recorded 88-test
+Functional suite, the 26-test focused Incremental suite, and the version and
+cleanup evidence checks. It is not a claim that every planned test case is
+already automated. The explicit follow-ups are INC-001, INC-002, INC-053,
+INC-063, INC-069, and INC-071 in the test plan.
+
+Each completed row requires SHA-512 verification of the downloaded artifact, the
+same complete Version string matching the expected release on every live FE and
+BE, the exact JDK identity, the adapter Git SHA, all 88 Functional tests, the
+26-test focused Incremental suite, and verified test-schema and process cleanup.
+The final runs recorded identical FE/BE versions with `Alive=true` and zero
+remaining test databases or helper relations. The gate rejects the `0.0.0`
+development placeholder. Every per-version JSON record contains a
+`doris_version_gate` object whose `expected_release` matches the matrix row,
+whose `reported_build` matches the exact FE/BE Version above, and whose `status`
+is `passed`.
+
+The earlier 2.1.11, 3.0.8, and 3.1.4 runs exercised a superseded implementation
+that reconstructed view DDL. The production design now combines forward-only
+physical CTAS snapshots with durable backup markers and never replays view DDL,
+so those results are stale and are not formal compatibility evidence. All five
+release rows were subsequently rerun; the passing results above supersede that
+historical evidence.
+
+The previous development mixed-cluster diagnostic (`321` Unit tests, `88`
+Functional tests, and `26` focused Incremental tests) predates the durable-marker
+and pre-model snapshot-ordering revisions and remains historical only. Doris
+2.1.11 exposed that selecting an old View depends on the caller's current
+`sql_mode`. Pre-model snapshot ordering fixed that case, and both the focused and
+complete suites passed on 2.1.11 in the final matrix. An earlier five-version
+run from a dirty adapter worktree was pre-validation only and is historical, not
+formal release evidence; the results above come from clean adapter commit
+`259b14e0ff77c1dac4c1963b918e0612b2901358` with `dirty=false`.
+
+Final local verification also recorded `324 passed, 9 warnings` in 26.71s for
+Unit tests; Flake8 and `git diff --check` passed. The final evidence environment
+used dbt Core 1.12.0, adapter 1.0.0, and Python 3.12.13. `python -m build`
+produced the `dbt_doris-1.0.0` sdist and wheel under
+`/tmp/dbt-doris-package-clean.tUhMxp`. The 75,660-byte wheel has SHA-256
+`edcbc1bae94e440c7be25f71ec96b6c91e4a5e71af29604561f4d99264584725`; the
+119,127-byte sdist has SHA-256
+`ffe4c9c41e8a7f6a24fb43935ec30535748095b2a807b634fe2266ede0b43ef9`.
+Twine 7.0.0 passed both. A clean Python 3.12.13 environment at
+`/tmp/dbt-doris-wheel-clean-py312.lPTWhm` installed the wheel successfully,
+imported the adapter from `site-packages`, contained all three checked macro
+files, reported
+`valid_incremental_strategies=[append,merge,insert_overwrite]`, and completed
+`pip check` with no broken requirements.
+
+Those package digests bind the package audit to implementation commit
+`259b14e0ff77c1dac4c1963b918e0612b2901358`; they are evidence hashes, not a
+promise that a later documentation-only or release build will have identical
+archive bytes.
+
+The exact-version evidence gate rejects `0.0.0` and requires every live FE and
+BE to report one identical complete Version string for the requested release.
+
+Functional-test database names now start with a prefix of at most 14 characters.
+The longest known generated database name is 62 characters, and the
+five-character base-36 random nonce provides 60,466,176 possible prefixes for
+each configured schema identity.
 
 The Python distribution remains named `dbt-doris`, and the adapter type used in
 `profiles.yml` remains `doris`.
@@ -72,11 +145,13 @@ The built-in Doris incremental strategies are `append`, `merge`, and
 | `merge` | MOW or MOR Unique Key | full-row `INSERT INTO` upsert |
 | `insert_overwrite` | writable Doris table | native whole-table or partition `INSERT OVERWRITE` |
 
-`merge` describes dbt's result semantics. It does not currently emit native
-`MERGE INTO`: Doris Unique Key storage resolves the upsert, including ordering
-from a visible column configured through `function_column.sequence_col`. The
-source batch must contain each configured key at most once. Partial-column merge
-configs and incremental predicates remain unsupported.
+`merge` describes dbt's result semantics. Native Doris `MERGE INTO` is available
+only on Doris 4.1 and newer, but the current adapter does not depend on it or
+emit it: Doris Unique Key storage resolves the adapter's full-row `INSERT INTO`
+upsert, including ordering from a visible column configured through
+`function_column.sequence_col`. The source batch must contain each configured
+key at most once. Partial-column merge configs and incremental predicates remain
+unsupported.
 
 Ordinary updates to an existing target with `on_schema_change='ignore'` create a
 temporary logical view for column metadata, but do not copy the batch into a
@@ -84,6 +159,67 @@ physical staging table. Each built-in strategy then performs one final DML
 statement. Schema-changing runs use a physical staging table to freeze the
 batch, while full refresh builds an intermediate table and exposes it through a
 metadata swap.
+
+The adapter never replays View DDL or assumes that a View retains creation-time
+SQL mode semantics. Doris 2.1.11 testing showed that selecting an old View can
+be affected by the caller's current `sql_mode`. Therefore, only the forward
+replacement of an active canonical View by a Table, Async MV, or Partition
+materialization uses a dedicated physical snapshot, and that snapshot must run
+before any new-model pre-hook, `sql_header`, or DDL:
+
+```sql
+CREATE TABLE backup
+DISTRIBUTED BY RANDOM BUCKETS AUTO
+PROPERTIES (
+  "enable_duplicate_without_keys_by_default" = "true",
+  "replication_num" = "..."
+)
+AS SELECT * FROM source_view;
+```
+
+The fixed Random/AUTO and duplicate-without-keys settings avoid selecting an
+invalid Key or Hash column when, for example, the View's first column is DOUBLE.
+The only model properties allowed on the snapshot are `replication_num` or
+`replication_allocation`; they come from the current model configuration and are
+never inferred from the old View. New-model key, distribution, partition,
+contract, and `sql_header` settings are excluded. The snapshot is a point-in-time
+copy of the rows queryable from the View in the current pre-model session. It
+does not preserve the View definition, creation-time session state, comments,
+grants, or identical schema properties.
+
+CTAS failure leaves the canonical View online and prevents all new-model hooks,
+headers, and DDL. After CTAS succeeds, the old View still remains online while
+the replacement relation is built. Only after that build completes does the
+adapter drop the old View and rename the replacement to the canonical name. The
+physical snapshot remains a recovery marker until the complete lifecycle
+succeeds. The helper rejects a source/destination name collision or an existing
+destination before issuing SQL. Generic View rename and exchange remain
+rejected.
+
+If replacement construction fails while the old View is still canonical, the
+next attempt cleans or replaces the stale physical marker before taking a new
+snapshot. If failure occurs in the drop/rename window and leaves the canonical
+name absent, the marker is retained as the only old-data copy. Recovery then
+depends on the target materialization: Incremental/Partition follow the durable
+no-restore rule below, while Table/Materialized View first restore the backup to
+the canonical name and then retry their type-switch lifecycle.
+
+Recovery from an existing `__dbt_backup` has a different boundary. When the
+canonical Incremental or Partition relation is absent, the backup remains under
+its original name as a durable marker; it may be a legacy View, Table, or Async
+MV. The adapter does not restore, execute, snapshot, rename, or drop it before
+building a fresh canonical relation from model SQL. Keeping the canonical name
+absent makes `is_incremental()` false on every failed retry. Old data remains
+queryable only through the backup name, and the canonical name is not guaranteed
+to be available during failure recovery. The marker is deleted only after the
+entire canonical build lifecycle succeeds. Thus legacy View backups never enter
+the CTAS path.
+
+This physical snapshot is limited to forward type switching; it does not change
+the logical temporary View and one-final-DML contract for normal `append`,
+`merge`, or `insert_overwrite` runs. SQL-mode-sensitive tests must assert the
+rows returned in the current pre-model session and the ordering boundary above;
+they must not infer creation-time SQL mode preservation from the View DDL.
 
 `delete+insert` (including the `delete_insert` spelling) is intentionally not
 supported; use `merge` for Unique Key upserts. This release also corrects the
@@ -175,7 +311,9 @@ unexpected, or timed-out task fails the model instead of being reported as a
 successful action. A dbt timeout does not cancel the asynchronous task already
 submitted to Doris.
 
-Outside-transaction pre-hooks run before deployed-definition inspection.
+Outside-transaction pre-hooks normally run before deployed-definition
+inspection. An active canonical View type replacement is the safety exception:
+its physical data snapshot runs before every new-model pre-hook, header, or DDL.
 Definition changes are built as a temporary MV and exposed through Doris's
 atomic materialized-view replacement; with `BUILD IMMEDIATE`, exposure happens
 only after the initial build succeeds, while `BUILD DEFERRED` intentionally has
@@ -217,7 +355,10 @@ Asynchronous-MV version evidence is:
 
 | Check | Coverage | What it proves |
 | --- | --- | --- |
-| Functional E2E against a live Doris cluster | 4.1.2-rc01 (`doris-4.1.2-rc01-4536b29f712`) | The implemented lifecycle works on this tested cluster |
+| Historical full Functional run on a mixed cluster | FE `doris-4.1.2-rc01-4536b29f712`; BE `doris-0.0.0-0a5ad292e3f`; 87 passed | The implemented paths worked on that exact mixed development cluster; this is not official-release compatibility evidence |
+| Current redesign validation | Clean commit `259b14e0ff77c1dac4c1963b918e0612b2901358`, `dirty=false`; Unit: 324 passed, 9 warnings, 26.71s; Flake8 and diff check passed | Local code and macro validation for the final implementation |
+| Package validation | `dbt_doris-1.0.0` sdist and wheel built; both passed Twine; clean Python 3.12 wheel install and `pip check` passed | The published package shape includes the adapter and checked macros and has consistent dependencies |
+| Official-release E2E matrix | 2.1.11, 3.0.8, 3.1.4, 4.0.7, and 4.1.3 each passed all 88 Functional and 26 focused Incremental tests | The final CTAS-snapshot, durable-marker, and pre-model-ordering implementation passed on those exact official-release builds |
 | Unit tests with mocked `SHOW FRONTENDS` rows | 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 | Version parsing and gate decisions only; no Doris feature compatibility |
 
 Before managing an asynchronous MV, the adapter prefers the connected and
@@ -226,12 +367,13 @@ validates the first returned row. An unparsable or unsupported selected FE is
 rejected. The current code gate accepts 2.x versions at 2.1.5 or newer, every
 3.x version except 3.0.0, and major version 4 or newer.
 
-Those boundaries are hard-coded runtime conditions, not results from a
-multi-version E2E matrix. In particular, this repository has not established
+Those boundaries are hard-coded runtime conditions, not results from the
+official-release E2E matrix. In particular, this repository has not established
 through live-cluster testing that 2.1.5 is the exact minimum or that 3.0.0 is
-incompatible. Gate acceptance is therefore not a compatibility guarantee.
-Before production use on a Doris release other than the live-tested version,
-run the functional suite against that release.
+incompatible. Gate acceptance and the historical mixed-cluster run are therefore
+not compatibility guarantees. Before production use, require a completed matrix
+row for the exact Doris release or run the same evidence procedure against that
+release.
 
 Only Doris asynchronous materialized views are managed. Synchronous
 materialized views (rollups) have a different lifecycle and remain explicitly

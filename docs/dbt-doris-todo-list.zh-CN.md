@@ -15,19 +15,21 @@
 | `insert_overwrite` | Doris 原生 `INSERT OVERWRITE` | P0 |
 | `microbatch` | 按 `event_time` 拆分时间批次 | P1 |
 
-当前名为 `insert_overwrite` 的实现，实际上是向 Unique Key 表执行
-`INSERT INTO`。同 Key 行更新、新 Key 行插入、未出现的旧 Key 保留，因此它应
-归到 `merge`，而不是 `insert_overwrite`。
+旧实现曾把 Unique Key `INSERT INTO` Upsert 命名为 `insert_overwrite`：同 Key
+行更新、新 Key 行插入、未出现的旧 Key 保留。当前已把这条路径归到 `merge`，
+`insert_overwrite` 则使用 Doris 原生覆盖语义。
 
-这里的 `merge` 指结果语义，不要求 SQL 文本必须是 `MERGE INTO`。首版复用
-Doris Unique Key Upsert；以后需要局部列更新等能力时，再评估原生
-`MERGE INTO`。
+这里的 `merge` 指结果语义，不要求 SQL 文本必须是 `MERGE INTO`。当前复用
+Doris Unique Key Upsert，在 2.1.11、3.0.8、3.1.4、4.0.7 和 4.1.3 的 E2E
+矩阵中都不依赖原生 `MERGE INTO`。原生 `MERGE INTO` 仅 Doris 4.1+ 提供；以后
+需要局部列更新等能力时，再建立独立的 4.1+ 路径和版本门禁。
 
 ## P0：升级到 dbt Core 1.12
 
 - [ ] 将依赖、Adapter 版本和测试环境统一到 dbt Core 1.12.x。
 - [ ] 更新已变化的 Adapter API 和宏接口。
-- [ ] 验证源码安装、wheel 构建、wheel 安装和 `pip check`。
+- [x] 验证 sdist/wheel 构建与 Twine、Python 3.12 全新 venv wheel 安装、
+  `site-packages` 导入、关键 Macro 文件、合法策略列表和 `pip check`。
 - [ ] CI 运行 Unit Test 和真实 Doris Functional Test。
 - [ ] Functional Test 至少覆盖 `dbt debug/seed/run/test/snapshot`。
 
@@ -61,7 +63,9 @@ Materialization；其 Doris 兼容工作放在 P1。
 - [x] 首次建表、普通增量和 Full Refresh 共用 Duplicate/Unique Key DDL，
   并保留 Key、Partition、Distribution 和 Properties。
 - [x] 普通三策略仅使用逻辑 `__dbt_tmp` View 获取列元数据，最终执行一条
-  DML；Schema Change 和自定义策略才创建物理 staging table。
+  DML；Schema Change 和自定义策略才创建物理 batch staging table。Active View
+  正向类型切换的 Pre-model CTAS Snapshot 与 Incremental/Partition 失败恢复的
+  Durable Marker 是独立例外，不改变普通策略契约。
 
 ### `append`
 
@@ -161,12 +165,73 @@ View，不作为 Incremental Strategy。
   纳入定义 Hash。
 - Doris 专用 Grants 支持显式 `role:<name>`、
   `user:<name>@<host>` Principal，以及 `grants_mode=replace/additive`。
-- 真实 Doris 集群 Functional E2E 当前只覆盖
-  4.1.2-rc01（`doris-4.1.2-rc01-4536b29f712`）。当前运行时 Gate 接受
-  2.x 中不低于 2.1.5 的版本、除 3.0.0 外的 3.x，以及主版本 4 及以上；
-  模拟版本字符串的 Gate 单测覆盖 2.1.5、2.1.10、3.0.1、3.1.0 和 4.1.2，
-  但不验证 Doris 功能兼容性。除已实测版本外，投入生产前需要在对应版本上
-  运行 Functional Test。运行时 `SHOW FRONTENDS` 优先校验当前连接 FE 和
+- 最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现已完成正式矩阵：
+  2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 均为完整 Functional 88 passed、聚焦
+  Incremental 26 passed。各版本 FE/BE 完整 Version 完全一致且 `Alive=true`，
+  测试数据库与 Helper Relation 残留均为 0。
+- 上述 `passed` 只表示已登记的两套测试、版本身份和清理证据通过；INC-001、
+  INC-002、INC-053、INC-063、INC-069、INC-071 仍为待补增强项，不声称所有
+  规划测试均已自动化。
+- 五版本完整 Functional 的 warnings/耗时依次为 `106/96.64s`、`106/96.59s`、
+  `106/99.73s`、`106/99.05s`、`106/99.16s`；聚焦 Incremental 依次为
+  `27/21.49s`、`27/21.79s`、`27/22.46s`、`27/22.26s`、`27/22.79s`。
+  环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.12.13；正式 Adapter SHA 为
+  `259b14e0ff77c1dac4c1963b918e0612b2901358`、`dirty=false`。每份版本 JSON 的
+  `doris_version_gate` 均记录对应 `expected_release`、完整 `reported_build`
+  和 `status=passed`。Unit 为 324 passed / 9 warnings / 26.71s，Flake8 与
+  diff check 通过；旧 dirty 工作树五版本运行仅作预验证和历史记录。
+- Doris 2.1.11 暴露的当前 Session `sql_mode` 问题已通过 Pre-model Ordering
+  修复，并由该版本的聚焦与完整套件验证通过。此前 View DDL 重放和混合集群结果
+  仅保留为历史证据。
+- Package 干净验证已完成，输出目录为 `/tmp/dbt-doris-package-clean.tUhMxp`：
+  75,660-byte wheel SHA-256 为
+  `edcbc1bae94e440c7be25f71ec96b6c91e4a5e71af29604561f4d99264584725`，
+  119,127-byte sdist 为
+  `ffe4c9c41e8a7f6a24fb43935ec30535748095b2a807b634fe2266ede0b43ef9`，
+  Twine 7.0.0 双 PASSED。Python 3.12.13 全新 venv
+  `/tmp/dbt-doris-wheel-clean-py312.lPTWhm` 完成 wheel 安装、`site-packages`
+  导入、三个关键 Macro、合法策略列表和 `pip check` 验证，均为 passed。
+- Adapter 绝不重放 View DDL，也不假设 View 保留创建时 SQL Mode/Session 语义。
+  只有 Active Canonical View → Table/MV/Partition 的正向类型替换使用专用物理
+  CTAS；它必须发生在新模型任何 Pre-hook、`sql_header` 或 DDL 之前，并固定
+  `DISTRIBUTED BY RANDOM BUCKETS AUTO` 和
+  `enable_duplicate_without_keys_by_default=true`，仅允许从当前模型配置额外携带
+  `replication_num` 或 `replication_allocation`，绝不从旧 View 推断副本属性。
+  Snapshot 不继承新模型的 Key、Distribution、Partition、Contract 或
+  `sql_header`。它保存 Pre-model 当前 Session 查询旧 View 得到的数据，不保存
+  Definition、创建时 Session 状态、Comment、Grant 或完全一致 Schema 属性。
+- CTAS 失败时旧 View 保持在线，且不能执行新模型 Hook/Header/DDL。CTAS 成功后也
+  不立即 Drop 旧 View：Replacement 构建完成前 Canonical 仍由旧 View 提供；完成
+  后才 Drop View 并把 Replacement Rename 为 Canonical。物理 Snapshot Marker
+  保留到完整生命周期成功后再清理。
+- Replacement Build 失败但旧 View 仍在线时，Retry 清理或替换陈旧 Marker 后重新
+  Snapshot；Drop/Rename 窗口失败导致 Canonical 缺失时，物理 Backup 作为唯一
+  旧数据副本保留。之后按目标 Materialization 分流：Incremental/Partition 不先
+  Restore，Table/MV 则先恢复 Canonical 再重试各自的类型切换。
+- Incremental/Partition 在 Canonical 缺失且 `__dbt_backup` 存在时，把原名 Backup
+  当作 Durable Marker 保留；它可以是 Legacy View、Table 或 Async MV。Retry 不
+  Restore、Snapshot、Rename、执行或提前删除 Backup，而是从 Model SQL 完整构建
+  Canonical；只有整个生命周期成功后才删除 Marker。连续失败期间 Canonical 仍
+  缺失，因此下一轮 `is_incremental()` 继续为 false。旧数据仅能通过 Backup 名
+  查询，不保证失败期间 Canonical 名可用；Legacy View Backup 不走 CTAS。
+- Snapshot Helper 在源/目标同名或目标已存在时，会在执行任何 SQL 前失败。
+  Generic View Rename/Exchange 明确拒绝。SQL Mode 用例必须按 Snapshot 当时
+  Pre-model Session 对旧 View 的实际查询结果断言，不能再从 View 创建模式推导
+  结果；各正式版本必须按新 Ordering 重新验证。
+- Incremental 与 Partition 都已增加三轮 Persistent Marker 用例：首次保留旧
+  Backup、再次失败仍不发布 Canonical、最终完整构建成功后才清理 Backup。
+- Snapshot 保存当时可查询的执行结果数据；Random/AUTO 与
+  Duplicate-without-keys 避免把 DOUBLE 等不可作 Key/Hash 的首列误选为物理 Key
+  或分桶列。
+- Merge Guard 从 n+1 个保留候选中选择不与 Model 列冲突的 Validation Alias；
+  Version Gate 拒绝 Expected `0.0.0`，并要求所有存活 FE/BE 的完整 Version
+  字符串完全一致。
+- Functional Schema Prefix 最长 14 字符，当前最长已知生成 Database 名为
+  62 字符；5 位 Base-36 随机 Nonce 为每个配置 Schema 身份提供 60,466,176 个
+  候选空间。
+- 当前运行时 Gate 接受 2.x 中不低于 2.1.5 的版本、除 3.0.0 外的 3.x，以及
+  主版本 4 及以上；模拟版本字符串的 Gate 单测只验证版本解析和 Gate 判断，
+  不验证 Doris 功能兼容性。运行时 `SHOW FRONTENDS` 优先校验当前连接 FE 和
   Master FE，无法识别角色时退回首行。
 - Sync Materialized View（Rollup）保持独立评估，本 TODO 不包含该能力。
 
@@ -204,6 +269,9 @@ View，不作为 Incremental Strategy。
 
 ## P3：生产能力
 
+- [x] 在最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现上完成
+  Doris 2.1.11、3.0.8、3.1.4、4.0.7 和 4.1.3 的精确版本 E2E；五个版本的完整
+  Functional 88 项与聚焦 Incremental 26 项均通过，节点版本与清理证据符合要求。
 - [ ] SSL、Timeout、Retry 和多 FE Failover。
 - [ ] Query ID、Invocation ID、影响行数和执行耗时。
 - [ ] Doris 服务端 Query Cancel。

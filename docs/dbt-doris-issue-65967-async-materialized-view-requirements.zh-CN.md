@@ -386,6 +386,38 @@ DROP MATERIALIZED VIEW IF EXISTS <name>;
 
 不能依赖当前通用 `drop {{ relation.type }}` 在错误 Relation Type 下猜测对象类型。
 
+View → Materialized View 不得重放 View DDL，也不得假设 View 保留创建时
+SQL Mode/Session 语义。Doris 2.1.11 实测表明，查询旧 View 会受调用 Session
+当前 `sql_mode` 影响。因此 Active Canonical View 的正向 Snapshot 必须发生在
+新模型任何 Pre-hook、`sql_header` 或 DDL 之前，并通过专用物理 CTAS 建立当前
+操作的新 Backup：固定
+`DISTRIBUTED BY RANDOM BUCKETS AUTO` 和
+`enable_duplicate_without_keys_by_default=true`，仅允许从当前模型配置额外携带
+`replication_num` 或 `replication_allocation`，绝不从旧 View 推断副本属性。
+当前操作新建的 Active View Backup 是物理 Table，只保存 Pre-model Session 当时
+从旧 View 可查询的数据，不保存 View Definition、创建时 Session 状态、Comment、
+Grant 或完全一致的 Schema 属性；这不表示历史遗留的 Backup 只能是 Table。
+
+CTAS 失败时旧 View 保持在线，且新模型 Hook/Header/DDL 均未运行。CTAS 成功后也
+不立即删除源 View；旧 View 继续服务 Canonical 名，直到 Replacement 构建完成，
+然后才 Drop View 并 Rename Replacement。Snapshot Marker 保留到完整生命周期
+成功后清理。Snapshot Helper 在源/目标同名或目标已存在时，必须在执行任何 SQL
+前失败。Generic View Rename/Exchange 明确拒绝。SQL Mode 用例必须按 Pre-model
+Session 的实际查询结果断言，不能从 View 创建模式推导结果。
+
+若 Replacement Build 失败而 Canonical 旧 View 仍在线，Retry 可清理或替换上次
+物理 Marker 并重新 Snapshot；若失败发生在 Drop/Rename 窗口导致 Canonical
+缺失，则必须保留物理 Backup 作为唯一旧数据副本。目标 Materialization 为
+Table/MV 时，下一轮先把 Backup 恢复到 Canonical 再重试；只有
+Incremental/Partition 使用下述 Durable No-restore 规则。
+
+Incremental/Partition 在 Canonical 缺失且 `__dbt_backup` 存在时，不恢复或转换
+Backup。该 Durable Marker 可以是 Legacy View、Table 或 Async MV；它保持原名，
+Retry 不执行、Snapshot、Rename 或提前 Drop，而是直接从 Model SQL 完整构建
+Canonical。连续失败保持 Canonical 缺失和 `is_incremental()=false`；旧数据只在
+Backup 名下可查。只有完整生命周期成功后才删除 Marker，因此 Legacy View
+Backup 不走 CTAS。
+
 ### R9. 保持 dbt 通用生命周期
 
 Materialization 至少应正确处理：
@@ -427,6 +459,26 @@ Table、View 和 Async MV 之间切换时按真实对象类型使用对应 DDL�
 `--full-refresh` 先构建临时 MV；Immediate 首次构建成功后再使用 Doris
 `REPLACE WITH MATERIALIZED VIEW` 原子替换，Deferred 按其语义不发起首次构建。
 部署 Comment 的 Pending/Complete 标记与备份 Relation 用于识别和恢复中断部署。
+Active Canonical View 正向切换时绝不重放 View DDL，也不依赖创建时 SQL Mode。
+Adapter 先于新模型 Pre-hook、`sql_header` 和 DDL 执行源 View，把 Pre-model
+Session 当时可查询的数据写入专用物理 CTAS Snapshot。Snapshot 固定 RANDOM/AUTO 与
+Duplicate-without-keys，仅允许从当前
+模型配置额外携带 `replication_num` 或 `replication_allocation`，绝不从旧 View
+推断副本属性。当前操作新建的 Active View Backup 为 Table，只保存结果数据；
+历史 Backup 仍可为 Legacy View、Table 或 Async MV。CTAS 失败时旧 View
+在线且不运行新模型上下文；CTAS 成功后旧 View 也保持在线，直到 Replacement
+构建完成才执行 Drop + Rename。Snapshot Helper 在源/目标同名或目标已存在时
+零 SQL，Generic View Rename/Exchange 明确拒绝。
+
+Incremental/Partition 的 Durable Marker Retry 不 Restore、执行、Snapshot、
+Rename 或提前删除 Backup，而是保持 Canonical 缺失，直接完整构建新 Canonical；
+只有全流程成功后才清理 Marker。三轮 Functional 用例覆盖连续失败仍保持
+`is_incremental()=false`，以及最终成功后清理 Backup。
+
+若失败时 Canonical 旧 View 仍在线，下一次尝试可清理上次的物理 Marker 并重新
+Snapshot；若失败发生在 Drop/Rename 窗口导致 Canonical 缺失，则必须保留物理
+Backup 作为唯一旧数据副本。Table/MV 下一轮先恢复 Canonical 再重试；只有
+Incremental/Partition 保持 Backup 原名并直接完整构建 Canonical。
 
 ### 6.2 Config、刷新语义与 Task 可观测性
 
@@ -456,25 +508,53 @@ Doris 专用 Grants 使用显式 `role:<name>`、`user:<name>@<host>` Principal�
 所有 Principal 在 MV DDL 前一次性校验，避免无效 Principal 暴露新定义或留下
 部分授权；User 按大小写精确比较，Role 和 Host 按 Doris 语义比较。
 
-Outside Pre-hook 在 `SHOW CREATE` 和配置漂移检查前执行；Inside Hook 参与实际
-部署动作。Inside Post-hook 成功后才把部署标记从 Pending 改为 Complete；
+Outside Pre-hook 通常在 `SHOW CREATE` 和配置漂移检查前执行；Active Canonical
+View 类型替换是安全例外，物理 Snapshot 必须早于 Outside/Inside Pre-hook、
+`sql_header` 和任何新模型 DDL。Inside Hook 参与实际部署动作。Inside Post-hook
+成功后才把部署标记从 Pending 改为 Complete；
 Replace 后 Post-hook 失败时保留旧 MV，并在下次运行先原子回滚再重试。
 
 ### 6.4 版本 Gate 与验证状态
 
-| 验证层级 | 覆盖范围 | 能说明什么 |
-| --- | --- | --- |
-| 真实 Doris 集群 Functional E2E | 4.1.2-rc01（`doris-4.1.2-rc01-4536b29f712`） | 当前 MV 生命周期在该测试集群通过 |
-| 模拟 `SHOW FRONTENDS` 返回值的 Gate 单测 | 2.1.5、2.1.10、3.0.1、3.1.0 和 4.1.2 | 只验证版本解析和 Gate 判断，不验证 Doris 功能兼容性 |
+| Doris | FE/BE 完整 Version | 完整 Functional | 聚焦 Incremental | 状态 |
+| --- | --- | --- | --- | --- |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 88 passed / 106 warnings / 96.64s | 26 passed / 27 warnings / 21.49s | passed |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 88 passed / 106 warnings / 96.59s | 26 passed / 27 warnings / 21.79s | passed |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 88 passed / 106 warnings / 99.73s | 26 passed / 27 warnings / 22.46s | passed |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 88 passed / 106 warnings / 99.05s | 26 passed / 27 warnings / 22.26s | passed |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 88 passed / 106 warnings / 99.16s | 26 passed / 27 warnings / 22.79s | passed |
+
+这里的 `passed` 只覆盖上表两套实际运行的测试、版本身份和清理证据；测试方案中
+INC-001、INC-002、INC-053、INC-063、INC-069、INC-071 仍待补，不能把本表
+扩大解释为所有规划用例已经自动化。
+
+五个版本的 FE/BE 完整 Version 均完全一致且 `Alive=true`，测试数据库和 Helper
+Relation 残留均为 0。环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.12.13；
+正式证据来自 Adapter SHA `259b14e0ff77c1dac4c1963b918e0612b2901358`、
+`dirty=false`；旧 dirty 工作树运行仅作预验证和历史记录。每份版本 JSON 的
+`doris_version_gate` 均记录匹配该行的 `expected_release`、完整
+`reported_build` 与 `status=passed`。Unit 为 324 passed / 9 warnings /
+26.71s，Flake8 和 diff check 均通过。
+
+Package 干净输出 `/tmp/dbt-doris-package-clean.tUhMxp` 中，75,660-byte wheel
+SHA-256 为 `edcbc1bae94e440c7be25f71ec96b6c91e4a5e71af29604561f4d99264584725`，
+119,127-byte sdist 为
+`ffe4c9c41e8a7f6a24fb43935ec30535748095b2a807b634fe2266ede0b43ef9`；
+Twine 7.0.0 双 PASSED。Python 3.12.13 全新 venv
+`/tmp/dbt-doris-wheel-clean-py312.lPTWhm` 完成 wheel 安装、`site-packages`
+导入、三个 Macro、策略列表和 `pip check` 验证，均为 passed。
 
 Adapter 通过 `SHOW FRONTENDS` 优先校验当前连接 FE 和 Master FE；无法识别
 角色时退回首行，被选中行无法解析或未通过 Gate 时失败。当前代码 Gate 接受
 2.x 中不低于 2.1.5 的版本、除 3.0.0 外的 3.x，以及主版本 4 及以上。
 
-这些边界是人为设置的运行条件，不是多版本 E2E 结论；当前真实集群 E2E
-没有证明 2.1.5 是准确最低版本，也没有证明 3.0.0 一定不兼容。除上述已实测
-版本外，投入生产前需要在对应版本上执行 Functional Test。生产 Schedule Unit
-为 minute/hour/day/week；测试专用的 second 会被 Adapter 拒绝。
+这些边界是人为设置的运行条件，不是多版本 E2E 得出的最低/排除版本结论。当前
+正式证据证明上表五个精确版本，仍没有证明 2.1.5 是准确最低版本或 3.0.0 一定
+不兼容。旧 2.1.11、3.0.8、3.1.4 的 View DDL 重放结果与历史 4.1.2 FE / `0.0.0`
+dev BE 混合集群结果仅作历史记录。2.1.11 曾暴露旧 View 查询依赖调用 Session
+当前 `sql_mode`；Pre-model Ordering 修复后，该版本的完整与聚焦套件均通过。
+生产 Schedule Unit 为 minute/hour/day/week；测试专用的 second 会被 Adapter
+拒绝。
 
 ## 7. 交付范围结论
 
@@ -585,6 +665,20 @@ ON COMMIT
 - 使用正确的 Drop DDL；
 - 最终对象类型正确；
 - dbt Relation Cache 不保留错误类型。
+- View → MV 使用物理 CTAS Snapshot，且 Snapshot 先于新模型所有
+  Pre-hook/`sql_header`/DDL；CTAS 失败时旧 View 在线且不运行新模型上下文；
+- CTAS 成功后旧 View 仍在线，直到 Replacement Build 完成才 Drop + Rename；
+- Snapshot 固定 RANDOM/AUTO 与 Duplicate-without-keys，仅允许从当前模型配置携带
+  `replication_num` 或 `replication_allocation`，绝不从旧 View 推断副本属性；
+  当前操作新建的 Active View Backup 为 Table，不继承其他目标配置，也不声称
+  保存 View 定义、Comment、Grant 或完全一致 Schema；
+- Incremental/Partition 的 Legacy View/Table/MV Backup 作为 Durable Marker 时
+  保持原名，不 Restore 或 Snapshot；Canonical 完整构建成功后才删除；
+- Table/MV 在 Canonical 缺失且 Backup 存在时，先恢复 Canonical 再重试；
+- Replacement Build 失败且旧 View 在线时清理/替换陈旧 Marker；Drop/Rename 窗口
+  失败导致 Canonical 缺失时按目标 Materialization 选择上述恢复路径；
+- 源/目标同名或目标已存在时零 SQL、零 Drop；Generic View Rename/Exchange
+  明确拒绝。
 
 ### AC9. 依赖和环境
 
@@ -602,6 +696,14 @@ ON COMMIT
 - Relation Type 识别 Unit Test；
 - 创建、重复运行、Manual Refresh、Schedule/Commit Skip、Deferred 第二次
   Refresh、等待/只提交、Full Refresh 和类型切换 Functional Test；
+- View Snapshot CTAS 失败保留源 View 的 Unit Test 与真实 Doris E2E；
+- CTAS 成功后 Rename 失败保留 Table Marker、Retry 完整构建 Canonical 并在成功
+  后清理的真实 Doris E2E；
+- SQL Mode 用例按 Pre-model Session 对 Active Canonical View 的实际查询结果
+  断言，并证明 Snapshot 先于新模型 `sql_header`；不得假设 View 创建模式被保存；
+- Incremental/Partition Persistent Marker 三轮 Functional Test：连续失败不发布
+  Canonical、不触碰 Backup，成功完整构建后才清理；
+- Snapshot Helper 的源/目标同名、目标已存在前置条件必须验证零 SQL、零 Drop；
 - 有 Doris 版本边界的兼容性测试或明确跳过条件。
 
 ## 9. 已确定的实现决策
@@ -623,7 +725,8 @@ ON COMMIT
 | 分区选择 | 由 Doris 按 MV 定义和 Refresh Method 管理；Adapter 不指定分区 |
 | Docs | 支持 `persist_docs.relation` 与 `persist_docs.columns` |
 | Grants | 显式 User/Role Principal；Replace 或 Additive |
-| Doris 版本验证 | 真实集群 E2E 仅覆盖 4.1.2-rc01 |
+| Doris 版本验证 | 2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 的正式版本矩阵均 passed；旧实现和开发混合集群结果仅作历史诊断 |
+| 普通 View 类型切换 | Active Canonical View 正向 Snapshot 先于新模型 Hook/Header/DDL，旧 View 在线到 Replacement Build 完成；Incremental/Partition 使用 Durable No-restore Marker，Table/MV 先恢复 Canonical；Generic View Rename/Exchange 拒绝 |
 | Doris 版本 Gate | 当前代码接受 2.x >= 2.1.5、3.x 排除 3.0.0、主版本 >= 4；这是运行条件，不是兼容性矩阵 |
 
 ## 10. 实现拆分结果
