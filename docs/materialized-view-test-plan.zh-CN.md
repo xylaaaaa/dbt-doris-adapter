@@ -48,20 +48,6 @@ MV 实现；如果以后这些文件发生变化，必须重新执行本测试�
 | `test_doris_materialized_view_complete.py` | dbt-doris Docs、Source、Alias、Schema 补充测试 | 2 |
 | **合计** |  | **21** |
 
-用例数量由下面的命令实际收集，不通过手工推算：
-
-```bash
-python -m pytest --collect-only -q \
-  test/functional/adapter/test_doris_materialized_view.py \
-  test/functional/adapter/test_doris_materialized_view_basic.py \
-  test/functional/adapter/test_doris_materialized_view_complete.py
-```
-
-结果为 `21 tests collected`。下文每一行对应一个 pytest Item；一个 Item 内可能
-包含多次 `dbt run` 和多个生命周期阶段，阶段不会拆成虚假的额外 Case 数。
-版本兼容性结论只依据这 21 个真实 Doris Functional Case；单元测试只补充异常和
-边界分支，不能代替真实 Doris 版本验证。
-
 ## 3. E2E 使用的 Doris 观测面
 
 测试不是只判断 `dbt run` 退出码。每个场景按需要使用以下 Doris SQL 验证真实
@@ -395,12 +381,7 @@ pytest 展开为 118 个 Item。它们补充覆盖：
 - MV Relation Listing、Catalog Type、缺失 Schema；
 - FE 版本解析、Connected/Master FE 选择和版本 Gate。
 
-这些是无真实 Doris 的单元测试，不计入第 6 节的 105 个版本 E2E 结果。精确 Item
-列表可用下面命令获取：
-
-```bash
-python -m pytest --collect-only -q test/unit/test_materialized_view.py
-```
+这些是无真实 Doris 的单元测试，不计入第 6 节的 105 个版本 E2E 结果。
 
 ## 9. 本轮没有覆盖的边界
 
