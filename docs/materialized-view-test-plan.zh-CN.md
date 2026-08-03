@@ -293,6 +293,18 @@ Seed 并用 `--full-refresh` 建立干净 MV，结束后重建测试 Schema。
 └── cleanup.log           # 对应测试 Schema 前缀的残留检查
 ```
 
+## 6. 清理验证
+
+pytest 完成后，每个版本重新启动其 FE 元数据并执行：
+
+```sql
+SHOW DATABASES LIKE 'dbt_adapter_mv_<version>_e2e%';
+```
+
+五个版本的返回行数均为 0。检查完成后关闭 FE；之前运行 pytest 的 FE/BE 也都已
+关闭。该结论只针对本专项测试创建的 Schema，不表示扫描或删除机器上其他用户的
+Doris 数据。
+
 ## 7. 单元测试补充覆盖
 
 真实 Doris E2E 之外，还执行：
@@ -316,3 +328,23 @@ pytest 展开为 118 个 Item。它们补充覆盖：
 - FE 版本解析、Connected/Master FE 选择和版本 Gate。
 
 这些是无真实 Doris 的单元测试，不计入第 5 节的 105 个版本 E2E 结果。
+
+## 8. 版本通过标准与结论
+
+一个 Doris 版本只有同时满足以下条件，才能加入 MV “已验证版本”表：
+
+1. FE/BE 完整 Version 与目标发行版一致且全部 `Alive=true`；
+2. dbt Core 1.12 环境实际收集到 21 个 MV Functional Case；
+3. 21 个 Case 全部 Pass，没有 Skip/Xfail/重跑后通过；
+4. pytest 退出码为 0；
+5. 测试 Schema 残留为 0，隔离进程已关闭；
+6. 日志能追溯到精确 Adapter Git SHA。
+
+按上述标准，当前已验证的精确 Doris 版本是：
+
+```text
+2.1.11、3.0.8、3.1.4、4.0.7、4.1.3
+```
+
+这不自动证明所有更高版本都兼容。同一发行线的后续 Patch 版本可以视为预期兼容，
+但必须重新执行本文件的 21 个 Case 后，才能把该精确版本写成“已验证”。
