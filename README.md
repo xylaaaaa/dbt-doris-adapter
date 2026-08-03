@@ -23,22 +23,21 @@ artifacts:
 
 | Doris release | Exact FE/BE Version | Complete Functional | Focused Incremental | State |
 | --- | --- | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 88 passed, 106 warnings, 96.64s | 26 passed, 27 warnings, 21.49s | Passed |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 88 passed, 106 warnings, 96.59s | 26 passed, 27 warnings, 21.79s | Passed |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 88 passed, 106 warnings, 99.73s | 26 passed, 27 warnings, 22.46s | Passed |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 88 passed, 106 warnings, 99.05s | 26 passed, 27 warnings, 22.26s | Passed |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 88 passed, 106 warnings, 99.16s | 26 passed, 27 warnings, 22.79s | Passed |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed, 106 warnings, 114.19s | 30 passed, 27 warnings, 28.48s | Passed |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed, 106 warnings, 116.70s | 30 passed, 27 warnings, 29.45s | Passed |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed, 106 warnings, 117.16s | 30 passed, 27 warnings, 30.53s | Passed |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed, 106 warnings, 120.79s | 30 passed, 27 warnings, 29.01s | Passed |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed, 106 warnings, 111.72s | 30 passed, 27 warnings, 29.92s | Passed |
 
-Here, `Passed` means that the exact release completed the recorded 88-test
-Functional suite, the 26-test focused Incremental suite, and the version and
-cleanup evidence checks. It is not a claim that every planned test case is
-already automated. The explicit follow-ups are INC-001, INC-002, INC-053,
-INC-063, INC-069, and INC-071 in the test plan.
+Here, `Passed` means that the exact release completed the recorded 92-test
+Functional suite, the 30-test focused Incremental suite, and the version and
+cleanup evidence checks. The focused suite now includes INC-001, INC-002,
+INC-053, INC-063, INC-069, and INC-071 from the test plan.
 
 Each completed row requires SHA-512 verification of the downloaded artifact, the
 same complete Version string matching the expected release on every live FE and
-BE, the exact JDK identity, the adapter Git SHA, all 88 Functional tests, the
-26-test focused Incremental suite, and verified test-schema and process cleanup.
+BE, the exact JDK identity, the adapter Git SHA, all 92 Functional tests, the
+30-test focused Incremental suite, and verified test-schema and process cleanup.
 The final runs recorded identical FE/BE versions with `Alive=true` and zero
 remaining test databases or helper relations. The gate rejects the `0.0.0`
 development placeholder. Every per-version JSON record contains a
@@ -61,9 +60,9 @@ and pre-model snapshot-ordering revisions and remains historical only. Doris
 complete suites passed on 2.1.11 in the final matrix. An earlier five-version
 run from a dirty adapter worktree was pre-validation only and is historical, not
 formal release evidence; the results above come from clean adapter commit
-`259b14e0ff77c1dac4c1963b918e0612b2901358` with `dirty=false`.
+`fd4a9471d68a0ea4d02cd96875eee3983554c118` with `dirty=false`.
 
-Final local verification also recorded `324 passed, 9 warnings` in 26.71s for
+Final local verification also recorded `324 passed, 9 warnings` in 31.28s for
 Unit tests; Flake8 and `git diff --check` passed. The final evidence environment
 used dbt Core 1.12.0, adapter 1.0.0, and Python 3.12.13. `python -m build`
 produced the `dbt_doris-1.0.0` sdist and wheel under
@@ -192,8 +191,9 @@ headers, and DDL. After CTAS succeeds, the old View still remains online while
 the replacement relation is built. Only after that build completes does the
 adapter drop the old View and rename the replacement to the canonical name. The
 physical snapshot remains a recovery marker until the complete lifecycle
-succeeds. The helper rejects a source/destination name collision or an existing
-destination before issuing SQL. Generic View rename and exchange remain
+succeeds. A source/destination name collision is rejected before any SQL. An
+existing destination may require a read-only relation metadata lookup, but is
+rejected before mutating SQL or a drop. Generic View rename and exchange remain
 rejected.
 
 If replacement construction fails while the old View is still canonical, the
@@ -228,7 +228,7 @@ like an upsert. To prevent a silent change to destructive overwrite semantics,
 the legacy combination `insert_overwrite + unique_key` is rejected: change the
 strategy to `merge` for upserts, or remove `unique_key` to explicitly opt in to
 native overwrite, which can remove rows absent from the new batch. See the
-[Chinese incremental guide](https://github.com/xylaaaaa/dbt-doris-adapter/blob/main/docs/incremental.zh-CN.md)
+[Chinese Incremental user guide](https://github.com/xylaaaaa/dbt-doris-adapter/blob/main/docs/incremental.zh-CN.md)
 for configuration and migration details, and the
 [Incremental test plan](https://github.com/xylaaaaa/dbt-doris-adapter/blob/main/docs/incremental-test-plan.zh-CN.md)
 for SQL-count and failure-recovery acceptance criteria.
@@ -356,9 +356,9 @@ Asynchronous-MV version evidence is:
 | Check | Coverage | What it proves |
 | --- | --- | --- |
 | Historical full Functional run on a mixed cluster | FE `doris-4.1.2-rc01-4536b29f712`; BE `doris-0.0.0-0a5ad292e3f`; 87 passed | The implemented paths worked on that exact mixed development cluster; this is not official-release compatibility evidence |
-| Current redesign validation | Clean commit `259b14e0ff77c1dac4c1963b918e0612b2901358`, `dirty=false`; Unit: 324 passed, 9 warnings, 26.71s; Flake8 and diff check passed | Local code and macro validation for the final implementation |
+| Current redesign validation | Clean commit `fd4a9471d68a0ea4d02cd96875eee3983554c118`, `dirty=false`; Unit: 324 passed, 9 warnings, 31.28s; Flake8 and diff check passed | Local code, macro, and completed edge-case validation for the final implementation |
 | Package validation | `dbt_doris-1.0.0` sdist and wheel built; both passed Twine; clean Python 3.12 wheel install and `pip check` passed | The published package shape includes the adapter and checked macros and has consistent dependencies |
-| Official-release E2E matrix | 2.1.11, 3.0.8, 3.1.4, 4.0.7, and 4.1.3 each passed all 88 Functional and 26 focused Incremental tests | The final CTAS-snapshot, durable-marker, and pre-model-ordering implementation passed on those exact official-release builds |
+| Official-release E2E matrix | 2.1.11, 3.0.8, 3.1.4, 4.0.7, and 4.1.3 each passed all 92 Functional and 30 focused Incremental tests | The final implementation and completed Incremental edge-case suite passed on those exact official-release builds |
 | Unit tests with mocked `SHOW FRONTENDS` rows | 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 | Version parsing and gate decisions only; no Doris feature compatibility |
 
 Before managing an asynchronous MV, the adapter prefers the connected and

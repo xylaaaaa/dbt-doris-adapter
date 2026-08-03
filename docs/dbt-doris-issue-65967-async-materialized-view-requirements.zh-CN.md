@@ -401,8 +401,9 @@ Grant 或完全一致的 Schema 属性；这不表示历史遗留的 Backup 只�
 CTAS 失败时旧 View 保持在线，且新模型 Hook/Header/DDL 均未运行。CTAS 成功后也
 不立即删除源 View；旧 View 继续服务 Canonical 名，直到 Replacement 构建完成，
 然后才 Drop View 并 Rename Replacement。Snapshot Marker 保留到完整生命周期
-成功后清理。Snapshot Helper 在源/目标同名或目标已存在时，必须在执行任何 SQL
-前失败。Generic View Rename/Exchange 明确拒绝。SQL Mode 用例必须按 Pre-model
+成功后清理。Snapshot Helper 在源/目标同名时必须在执行任何 SQL 前失败；目标已
+存在时只允许只读 Relation 元数据查询，必须在修改 SQL 或 Drop 前失败。Generic
+View Rename/Exchange 明确拒绝。SQL Mode 用例必须按 Pre-model
 Session 的实际查询结果断言，不能从 View 创建模式推导结果。
 
 若 Replacement Build 失败而 Canonical 旧 View 仍在线，Retry 可清理或替换上次
@@ -467,8 +468,9 @@ Duplicate-without-keys，仅允许从当前
 推断副本属性。当前操作新建的 Active View Backup 为 Table，只保存结果数据；
 历史 Backup 仍可为 Legacy View、Table 或 Async MV。CTAS 失败时旧 View
 在线且不运行新模型上下文；CTAS 成功后旧 View 也保持在线，直到 Replacement
-构建完成才执行 Drop + Rename。Snapshot Helper 在源/目标同名或目标已存在时
-零 SQL，Generic View Rename/Exchange 明确拒绝。
+构建完成才执行 Drop + Rename。Snapshot Helper 在源/目标同名时零 SQL；目标已
+存在时只允许只读 Relation 元数据查询，零修改 SQL、零 Drop。Generic View
+Rename/Exchange 明确拒绝。
 
 Incremental/Partition 的 Durable Marker Retry 不 Restore、执行、Snapshot、
 Rename 或提前删除 Backup，而是保持 Canonical 缺失，直接完整构建新 Canonical；
@@ -518,23 +520,23 @@ Replace 后 Post-hook 失败时保留旧 MV，并在下次运行先原子回滚�
 
 | Doris | FE/BE 完整 Version | 完整 Functional | 聚焦 Incremental | 状态 |
 | --- | --- | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 88 passed / 106 warnings / 96.64s | 26 passed / 27 warnings / 21.49s | passed |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 88 passed / 106 warnings / 96.59s | 26 passed / 27 warnings / 21.79s | passed |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 88 passed / 106 warnings / 99.73s | 26 passed / 27 warnings / 22.46s | passed |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 88 passed / 106 warnings / 99.05s | 26 passed / 27 warnings / 22.26s | passed |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 88 passed / 106 warnings / 99.16s | 26 passed / 27 warnings / 22.79s | passed |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed / 106 warnings / 114.19s | 30 passed / 27 warnings / 28.48s | passed |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed / 106 warnings / 116.70s | 30 passed / 27 warnings / 29.45s | passed |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed / 106 warnings / 117.16s | 30 passed / 27 warnings / 30.53s | passed |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed / 106 warnings / 120.79s | 30 passed / 27 warnings / 29.01s | passed |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed / 106 warnings / 111.72s | 30 passed / 27 warnings / 29.92s | passed |
 
 这里的 `passed` 只覆盖上表两套实际运行的测试、版本身份和清理证据；测试方案中
-INC-001、INC-002、INC-053、INC-063、INC-069、INC-071 仍待补，不能把本表
-扩大解释为所有规划用例已经自动化。
+当前登记的 Incremental 场景（包括 INC-001、INC-002、INC-053、INC-063、
+INC-069、INC-071）均已自动化。
 
 五个版本的 FE/BE 完整 Version 均完全一致且 `Alive=true`，测试数据库和 Helper
 Relation 残留均为 0。环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.12.13；
-正式证据来自 Adapter SHA `259b14e0ff77c1dac4c1963b918e0612b2901358`、
-`dirty=false`；旧 dirty 工作树运行仅作预验证和历史记录。每份版本 JSON 的
-`doris_version_gate` 均记录匹配该行的 `expected_release`、完整
-`reported_build` 与 `status=passed`。Unit 为 324 passed / 9 warnings /
-26.71s，Flake8 和 diff check 均通过。
+正式证据来自 Adapter SHA `fd4a9471d68a0ea4d02cd96875eee3983554c118`、
+`dirty=false`；旧 dirty 工作树运行仅作预验证和历史记录。每份 Functional 和
+聚焦日志开头的 `DORIS_E2E_VERSION_EVIDENCE` JSON 均记录匹配该行的
+`expected_release`、完整 `reported_build` 与 `status=passed`。Unit 为
+324 passed / 9 warnings / 31.28s，Flake8 和 diff check 均通过。
 
 Package 干净输出 `/tmp/dbt-doris-package-clean.tUhMxp` 中，75,660-byte wheel
 SHA-256 为 `edcbc1bae94e440c7be25f71ec96b6c91e4a5e71af29604561f4d99264584725`，
@@ -677,8 +679,8 @@ ON COMMIT
 - Table/MV 在 Canonical 缺失且 Backup 存在时，先恢复 Canonical 再重试；
 - Replacement Build 失败且旧 View 在线时清理/替换陈旧 Marker；Drop/Rename 窗口
   失败导致 Canonical 缺失时按目标 Materialization 选择上述恢复路径；
-- 源/目标同名或目标已存在时零 SQL、零 Drop；Generic View Rename/Exchange
-  明确拒绝。
+- 源/目标同名时零 SQL；目标已存在时只允许只读 Relation 元数据查询；两者均零
+  修改 SQL、零 Drop。Generic View Rename/Exchange 明确拒绝。
 
 ### AC9. 依赖和环境
 
@@ -703,7 +705,8 @@ ON COMMIT
   断言，并证明 Snapshot 先于新模型 `sql_header`；不得假设 View 创建模式被保存；
 - Incremental/Partition Persistent Marker 三轮 Functional Test：连续失败不发布
   Canonical、不触碰 Backup，成功完整构建后才清理；
-- Snapshot Helper 的源/目标同名、目标已存在前置条件必须验证零 SQL、零 Drop；
+- Snapshot Helper 必须验证源/目标同名时零 SQL，以及目标已存在时只读元数据查询、
+  零修改 SQL、零 Drop；
 - 有 Doris 版本边界的兼容性测试或明确跳过条件。
 
 ## 9. 已确定的实现决策

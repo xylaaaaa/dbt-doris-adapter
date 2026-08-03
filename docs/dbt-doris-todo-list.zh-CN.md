@@ -166,20 +166,21 @@ View，不作为 Incremental Strategy。
 - Doris 专用 Grants 支持显式 `role:<name>`、
   `user:<name>@<host>` Principal，以及 `grants_mode=replace/additive`。
 - 最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现已完成正式矩阵：
-  2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 均为完整 Functional 88 passed、聚焦
-  Incremental 26 passed。各版本 FE/BE 完整 Version 完全一致且 `Alive=true`，
+  2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 均为完整 Functional 92 passed、聚焦
+  Incremental 30 passed。各版本 FE/BE 完整 Version 完全一致且 `Alive=true`，
   测试数据库与 Helper Relation 残留均为 0。
-- 上述 `passed` 只表示已登记的两套测试、版本身份和清理证据通过；INC-001、
-  INC-002、INC-053、INC-063、INC-069、INC-071 仍为待补增强项，不声称所有
-  规划测试均已自动化。
-- 五版本完整 Functional 的 warnings/耗时依次为 `106/96.64s`、`106/96.59s`、
-  `106/99.73s`、`106/99.05s`、`106/99.16s`；聚焦 Incremental 依次为
-  `27/21.49s`、`27/21.79s`、`27/22.46s`、`27/22.26s`、`27/22.79s`。
+- INC-001、INC-002、INC-053、INC-063、INC-069、INC-071 已补入五版本 E2E；
+  测试计划当前登记的 Incremental 场景全部自动化。
+- 五版本完整 Functional 的 warnings/耗时依次为 `106/114.19s`、
+  `106/116.70s`、`106/117.16s`、`106/120.79s`、`106/111.72s`；聚焦
+  Incremental 依次为 `27/28.48s`、`27/29.45s`、`27/30.53s`、`27/29.01s`、
+  `27/29.92s`。
   环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.12.13；正式 Adapter SHA 为
-  `259b14e0ff77c1dac4c1963b918e0612b2901358`、`dirty=false`。每份版本 JSON 的
-  `doris_version_gate` 均记录对应 `expected_release`、完整 `reported_build`
-  和 `status=passed`。Unit 为 324 passed / 9 warnings / 26.71s，Flake8 与
-  diff check 通过；旧 dirty 工作树五版本运行仅作预验证和历史记录。
+  `fd4a9471d68a0ea4d02cd96875eee3983554c118`、`dirty=false`。每份 Functional
+  和聚焦日志开头的 `DORIS_E2E_VERSION_EVIDENCE` JSON 均记录对应
+  `expected_release`、完整 `reported_build` 和 `status=passed`。Unit 为
+  324 passed / 9 warnings / 31.28s，Flake8 与 diff check 通过；旧 dirty 工作树
+  五版本运行仅作预验证和历史记录。
 - Doris 2.1.11 暴露的当前 Session `sql_mode` 问题已通过 Pre-model Ordering
   修复，并由该版本的聚焦与完整套件验证通过。此前 View DDL 重放和混合集群结果
   仅保留为历史证据。
@@ -214,8 +215,9 @@ View，不作为 Incremental Strategy。
   Canonical；只有整个生命周期成功后才删除 Marker。连续失败期间 Canonical 仍
   缺失，因此下一轮 `is_incremental()` 继续为 false。旧数据仅能通过 Backup 名
   查询，不保证失败期间 Canonical 名可用；Legacy View Backup 不走 CTAS。
-- Snapshot Helper 在源/目标同名或目标已存在时，会在执行任何 SQL 前失败。
-  Generic View Rename/Exchange 明确拒绝。SQL Mode 用例必须按 Snapshot 当时
+- Snapshot Helper 在源/目标同名时会在执行任何 SQL 前失败；目标已存在时只允许
+  只读 Relation 元数据查询，零修改 SQL、零 Drop。Generic View
+  Rename/Exchange 明确拒绝。SQL Mode 用例必须按 Snapshot 当时
   Pre-model Session 对旧 View 的实际查询结果断言，不能再从 View 创建模式推导
   结果；各正式版本必须按新 Ordering 重新验证。
 - Incremental 与 Partition 都已增加三轮 Persistent Marker 用例：首次保留旧
@@ -271,7 +273,7 @@ View，不作为 Incremental Strategy。
 
 - [x] 在最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现上完成
   Doris 2.1.11、3.0.8、3.1.4、4.0.7 和 4.1.3 的精确版本 E2E；五个版本的完整
-  Functional 88 项与聚焦 Incremental 26 项均通过，节点版本与清理证据符合要求。
+  Functional 92 项与聚焦 Incremental 30 项均通过，节点版本与清理证据符合要求。
 - [ ] SSL、Timeout、Retry 和多 FE Failover。
 - [ ] Query ID、Invocation ID、影响行数和执行耗时。
 - [ ] Doris 服务端 Query Cancel。

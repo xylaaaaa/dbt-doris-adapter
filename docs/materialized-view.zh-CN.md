@@ -9,40 +9,7 @@ CREATE/REPLACE/DROP、刷新策略和失败恢复。对于 `ON MANUAL`，定义�
 本 Materialization **只管理 Doris 异步物化视图**。Doris Sync Materialized
 View（Rollup）具有不同的 DDL 和生命周期，不在本实现范围内。
 
-## 版本与验证状态
-
-最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现在五个正式版本上
-全部通过：
-
-| Doris | FE/BE 完整 Version | 完整 Functional | 聚焦 Incremental |
-| --- | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 88 passed / 106 warnings / 96.64s | 26 passed / 27 warnings / 21.49s |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 88 passed / 106 warnings / 96.59s | 26 passed / 27 warnings / 21.79s |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 88 passed / 106 warnings / 99.73s | 26 passed / 27 warnings / 22.46s |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 88 passed / 106 warnings / 99.05s | 26 passed / 27 warnings / 22.26s |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 88 passed / 106 warnings / 99.16s | 26 passed / 27 warnings / 22.79s |
-
-“通过”仅表示上表精确版本完成已登记的 88 项完整 Functional、26 项聚焦
-Incremental、版本身份和清理检查；测试方案中的六个明确增强项仍待补，不能据此
-声称全部规划场景已自动化。
-
-每个版本的 FE/BE 完整 Version 完全一致且 `Alive=true`，测试数据库和 Helper
-Relation 残留均为 0。环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.12.13。
-正式证据来自 Adapter Git SHA
-`259b14e0ff77c1dac4c1963b918e0612b2901358` 且 `dirty=false`；更早的 dirty
-工作树五版本运行只作预验证和历史记录。每个版本 JSON 的
-`doris_version_gate` 均记录对应 `expected_release`、上表完整
-`reported_build` 和 `status=passed`。Unit 为 324 passed / 9 warnings / 26.71s，
-Flake8 与 diff check 均通过。
-
-干净 Package 输出位于 `/tmp/dbt-doris-package-clean.tUhMxp`：75,660-byte wheel
-的 SHA-256 为
-`edcbc1bae94e440c7be25f71ec96b6c91e4a5e71af29604561f4d99264584725`，
-119,127-byte sdist 为
-`ffe4c9c41e8a7f6a24fb43935ec30535748095b2a807b634fe2266ede0b43ef9`，
-Twine 7.0.0 对二者均 PASSED。Python 3.12.13 全新 venv
-`/tmp/dbt-doris-wheel-clean-py312.lPTWhm` 从 wheel 安装成功，Adapter 从
-`site-packages` 导入，三个关键 Macro 文件、合法策略列表和 `pip check` 均通过。
+## Async MV 版本门禁与验证状态
 
 dbt Core 的开发与测试基线是 1.12.x。每次管理 Async MV 前，Adapter 会从
 `SHOW FRONTENDS` 优先读取当前连接 FE 和 Master FE 的版本；如果返回结果无法
@@ -50,12 +17,28 @@ dbt Core 的开发与测试基线是 1.12.x。每次管理 Async MV 前，Adapte
 直接失败。当前代码 Gate 接受 2.x 中不低于 2.1.5 的版本、除 3.0.0 外的
 3.x，以及主版本 4 及以上。
 
+Async MV 生命周期已经在以下五个 Doris 官方发行版本的完整 Adapter Functional
+套件中通过：
+
+| Doris | FE/BE 完整 Version | Async MV 状态 |
+| --- | --- | --- |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 已验证 |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 已验证 |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 已验证 |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 已验证 |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 已验证 |
+
+被测 Adapter 提交为 `fd4a9471d68a0ea4d02cd96875eee3983554c118`、
+`dirty=false`；环境为 dbt Core 1.12.0、dbt-doris 1.0.0、Python 3.12.13。
+五个版本的 FE/BE 完整 Version 均一致且 `Alive=true`，测试数据库和 Helper
+Relation 残留均为 0。
+
 这组边界是代码中人为设置的运行条件，不是多版本 E2E 得出的最低/排除版本结论。
 当前证据证明的是上表五个精确版本，仍没有证明 2.1.5 是准确最低版本或 3.0.0
 一定不兼容，因此本文不把 Gate 放行范围整体称为“支持版本范围”。此前
 2.1.11、3.0.8、3.1.4 的 View DDL 重放结果，以及 FE 4.1.2/BE `0.0.0` 的
 混合集群结果，仅保留为历史证据。2.1.11 曾发现旧 View 查询受调用 Session 当前
-`sql_mode` 影响；Pre-model Ordering 修复后，其完整与聚焦套件均已通过。
+`sql_mode` 影响；Pre-model Ordering 修复后，其完整 Functional 套件已通过。
 
 生产定时任务支持 `minute`、`hour`、`day` 和 `week`。Adapter 会拒绝
 `second`，因为 Doris 只通过测试专用设置开启秒级 Schedule。
@@ -372,16 +355,12 @@ view  ↔ materialized_view
 - 若 Replacement Build 失败但 Canonical 旧 View 仍在线，Retry 先清理或替换陈旧
   Snapshot Marker，再重新冻结旧 View；若失败发生在 Drop/Rename 窗口导致
   Canonical 缺失，则保留物理 Backup 作为唯一旧数据副本。目标仍是 Table/MV
-  时，下一轮先把 Backup 恢复到 Canonical，再重试类型切换；只有
-  Incremental/Partition 使用下一项的 Durable No-restore 规则。
-- Incremental/Partition 若在后续类型切换中发现 Canonical 缺失且
-  `__dbt_backup` 存在，会把 Backup 原名保留为 Durable Marker。它可以是 Legacy
-  View、Table 或 Async MV；Retry 不 Restore、执行、Snapshot、Rename 或提前
-  Drop，而是直接完整构建 Canonical，整个生命周期成功后才清理 Marker。连续失败
-  期间 Canonical 保持缺失，旧数据只能通过 Backup 名查询。Legacy View Backup
-  因此不走 CTAS。
-- Snapshot Helper 在源/目标同名或目标已存在时，会在执行任何 SQL 前
-  失败；Generic View Rename/Exchange 明确拒绝。
+  时，下一轮先把 Backup 恢复到 Canonical，再重试类型切换。若目标改成
+  Incremental/Partition，则由目标 Materialization 的恢复规则接管，详见
+  [Incremental 用户指南](incremental.zh-CN.md)。
+- Snapshot Helper 遇到源/目标同名时会在执行任何 SQL 前失败；目标已存在时可能
+  先做只读 Relation 元数据查询，但不会执行修改 SQL 或 Drop。Generic View
+  Rename/Exchange 明确拒绝。
 - MV → Table：先构建 Intermediate Table，再把旧 MV 以相同 Relation Type Rename
   到 `__dbt_backup`，随后把 Intermediate Table Rename 为 Canonical；只有完整流程
   成功后才删除 MV Backup。第二次 Rename 或后续流程失败时，同类型 MV Backup

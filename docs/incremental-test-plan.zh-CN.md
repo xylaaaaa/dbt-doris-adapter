@@ -44,9 +44,9 @@ Doris 在 `INSERT OVERWRITE` 内部创建临时分区、写 Rowset 或发布版�
 | 4.0.7 | **Stable** | `doris-4.0.7-rc02-35854e7e92a` | passed |
 | 4.1.3 | **Latest** | `doris-4.1.3-rc02-7126cf65d96` | passed |
 
-这里的 `passed` 只表示该精确版本完成了本文登记的 88 项完整 Functional、26 项
-聚焦 Incremental、版本身份和清理证据，不表示第 5 节所有规划用例都已自动化。
-INC-001、INC-002、INC-053、INC-063、INC-069、INC-071 仍是明确的增强项。
+这里的 `passed` 表示该精确版本完成了本文登记的 92 项完整 Functional、30 项
+聚焦 Incremental、版本身份和清理证据；第 5 节当前登记的用例均已有对应自动化
+覆盖。它仍不是对任意未列场景或其他 Doris Patch 版本的泛化兼容承诺。
 
 发布定位与环境基线分别以 Doris 官方
 [下载页](https://doris.apache.org/download/)、
@@ -76,10 +76,11 @@ Doris 原生 `MERGE INTO` 只在 4.1+ 提供，但当前 dbt-doris 的 `merge` �
    完整版本和架构；
 4. Adapter Git SHA、工作树是否 dirty、dbt Core 版本、Python 版本、机器架构和
    测试 Endpoint；
-5. 完整 `test/functional/adapter` 恰好 **88 passed**，不得用选测、跳过或 xfail
+5. 完整 `test/functional/adapter` 恰好 **92 passed**，不得用选测、跳过或 xfail
    替代；
-6. 关键 Incremental 套件 **26 passed**，保存 SQL 次数、MOW、MOR、Sequence、
-   整表/静态/动态 Overwrite、失败原子性和 Full Refresh 证据；
+6. 关键 Incremental 套件 **30 passed**，保存默认路由、SQL 次数、MOW、MOR、
+   Sequence、整表/静态/动态 Overwrite、Schema Fail、Hook、失败原子性、Helper
+   前置条件、陈旧对象清理和 Full Refresh 证据；
 7. 测试 Schema、辅助 Relation、FE/BE 进程和占用端口均完成清理，并记录复查结果。
 
 Functional Session 会输出一行
@@ -132,7 +133,7 @@ export DORIS_TEST_SCHEMA=dbt_e2e_3_0_8
 export DORIS_TEST_REPLICATION_NUM=1
 export DORIS_TEST_EXPECTED_VERSION=3.0.8
 
-# 正式版本证据必须是完整 Adapter 套件，当前预期结果恰好为 88 passed。
+# 正式版本证据必须是完整 Adapter 套件，当前预期结果恰好为 92 passed。
 python -m pytest -q test/functional/adapter
 
 # 再单独运行关键 Incremental，便于归档聚焦日志和 SQL 事件。
@@ -140,9 +141,9 @@ python -m pytest -q test/functional/adapter/test_doris_incremental.py
 ```
 
 每个版本必须保存两次运行的完整输出以及
-`DORIS_E2E_VERSION_EVIDENCE=<JSON>` 行。第二条命令不能替代 88 项完整套件。
+`DORIS_E2E_VERSION_EVIDENCE=<JSON>` 行。第二条命令不能替代 92 项完整套件。
 当前 `test/functional` 下只有 `adapter/`，所以 umbrella 路径也会收集同样的
-88 项；正式证据仍记录本轮实际执行的 `test/functional/adapter` 命令。
+92 项；正式证据仍记录本轮实际执行的 `test/functional/adapter` 命令。
 `DORIS_TEST_EXPECTED_VERSION` 必须设置为当前矩阵行；Session Gate 会在测试前
 检查所有存活 FE/BE 的完整 Version 字符串。Expected `0.0.0` 会被拒绝；所有
 存活节点必须返回完全相同的 Version，且属于该精确版本，否则停止运行。
@@ -304,8 +305,9 @@ AS SELECT * FROM source_view;
 9. 只有 Canonical 的 Main Build、适用的 Index/Grants/Docs/Hook 和 Commit 全部成功
    后才能 Drop Marker；Incremental/Partition 的 Legacy View Backup 永远不走
    CTAS；
-10. Snapshot Helper 在源/目标同名或目标已存在时，必须在执行任何 SQL
-   前失败；Generic View Rename/Exchange 同样在破坏性 SQL 前明确拒绝；
+10. Snapshot Helper 在源/目标同名时必须在执行任何 SQL 前失败；目标已存在时
+    只允许只读 Relation 元数据查询，必须在修改 SQL 或 Drop 前失败；Generic
+    View Rename/Exchange 同样在破坏性 SQL 前明确拒绝；
 11. SQL Mode 用例按 Pre-model Session 当时实际查询到的行断言，并证明后续
    `sql_header` 不会反向影响已经冻结的数据；不得从 View 创建模式推导结果；
 12. 这条物理 CTAS 仅是正向类型切换 Snapshot，不得被统计为普通内置 Incremental
@@ -315,8 +317,8 @@ AS SELECT * FROM source_view;
 
 | 编号 | 场景 | 关键断言 | 当前自动化 |
 | --- | --- | --- | --- |
-| INC-001 | 默认策略，无 `unique_key` | 路由到 `append` | Unit 已覆盖，E2E 待补 |
-| INC-002 | 默认策略，有 `unique_key` | 路由到 `merge` | Unit 已覆盖，E2E 待补 |
+| INC-001 | 默认策略，无 `unique_key` | 路由到 `append` | Unit 与五版本 E2E 已覆盖 |
+| INC-002 | 默认策略，有 `unique_key` | 路由到 `merge` | Unit 与五版本 E2E 已覆盖 |
 | INC-010 | `append` 首次与二次运行 | Duplicate Key；旧行保留，新行追加；普通运行无物理 staging | 已覆盖 |
 | INC-020 | MOW `merge` | 同 Key 更新、新 Key 插入、未出现旧 Key 保留；一条目标 `INSERT` | 已覆盖 |
 | INC-021 | MOR `merge` | 与 MOW 相同的结果语义 | 已覆盖 |
@@ -336,21 +338,21 @@ AS SELECT * FROM source_view;
 | INC-050 | `ignore` 下 VARCHAR 扩容 | 大小写不敏感匹配；无物理 staging；等待 Alter 完成 | 已覆盖 |
 | INC-051 | Key/Sequence 类型变化 | 修改物理不可变列前失败，提示 Full Refresh | Key E2E、Key/Sequence Unit 已覆盖 |
 | INC-052 | 仅列名大小写变化 | 不误发 Add + Drop，不删除 Key | 已覆盖 |
-| INC-053 | `fail` | 目标 Schema 与数据均不改变 | dbt Core 契约已覆盖；目标不变断言待加强 |
+| INC-053 | `fail` | 目标 Schema、列元数据、数据和 DDL 均不改变；零目标 DML/ALTER/交换 | 五版本 E2E 已覆盖 |
 | INC-054 | `append_new_columns` | 新列添加完成后写入冻结批次 | dbt Core 契约已覆盖 |
 | INC-055 | `sync_all_columns` | Add/Drop/Type Change 后正确写入 | dbt Core 契约已覆盖 |
 | INC-060 | Full Refresh | 配置保留；一次 intermediate CTAS、零 copy INSERT、一次元数据交换 | 已覆盖 |
 | INC-061 | View → Table | 新模型上下文前 Snapshot；旧 View 在线完成 Replacement Build；再 Drop + Rename | 五版本正式 E2E 已覆盖 |
 | INC-062 | Incremental/Partition Drop/Rename 窗口失败重试 | Canonical 缺失；物理 Table Marker 原名保留；Retry 完整构建成功后才清理 | Failure Injection 与五版本正式 E2E 已覆盖 |
-| INC-063 | Incremental/Partition 陈旧 temp/intermediate/backup | Canonical 存在时清理陈旧对象；Canonical 缺失时不误删 Durable Marker | Marker E2E 已覆盖，其余待补 |
+| INC-063 | Incremental/Partition 陈旧 temp/intermediate/backup | Canonical 存在时清理陈旧对象；Canonical 缺失时不误删 Durable Marker | 五版本 E2E 已覆盖 |
 | INC-064 | View → MV/Partition | 使用同一 Pre-model CTAS Snapshot 边界；旧 View 在线到 Replacement Build 完成 | 五版本正式 E2E 已覆盖 |
 | INC-065 | View Snapshot CTAS 失败 | 源 View 保持在线；新模型 Hook/Header/DDL 均未执行 | CTAS Failure 与 Ordering 断言经五版本正式 E2E 覆盖 |
 | INC-066 | Snapshot 配置与保真边界 | 固定 RANDOM/AUTO + Duplicate-without-keys；仅从当前模型携带 `replication_num` 或 `replication_allocation`；只保存结果数据 | 已覆盖 |
 | INC-067 | 当前 Session SQL Mode + 首列 DOUBLE | 以 Pre-model Session 实际查询结果为准；Snapshot 后再运行新模型 `sql_header`；不声称保留创建模式 | 2.1.11 发现已修复；五版本完整与聚焦套件均通过 |
 | INC-068 | Generic View Rename/Exchange | 在破坏性 SQL 前明确拒绝 | 已覆盖 |
-| INC-069 | View Snapshot Helper 前置条件 | 源/目标同名或目标已存在时零 SQL、零 Drop | Unit 已覆盖；E2E 待补 |
+| INC-069 | View Snapshot Helper 前置条件 | 源/目标同名时零 SQL；目标已存在时只允许只读元数据查询；两者均零修改 SQL、零 Drop | Unit 与五版本 E2E 已覆盖 |
 | INC-070 | 无效 Grants | Principal/Mode 校验先于目标 DML，目标数据不变 | 已覆盖 |
-| INC-071 | Pre/Post Hook 失败 | 明确失败发生阶段与目标、辅助对象状态 | 待补 |
+| INC-071 | Pre/Post Hook 失败 | Pre 失败零 staging/DML；Post 失败后 DML 可见、逻辑 View 保留；Retry 先清理并收敛 | 五版本 E2E 已覆盖 |
 | INC-072 | Persistent Backup Marker 三轮运行 | Incremental/Partition 连续失败不发布 Canonical、不触碰 Backup；成功完整构建后才清理 | 真实 Doris E2E 已覆盖 |
 | INC-080 | 自定义策略 | physical staging + dbt 标准五参数契约 | 已覆盖 |
 
@@ -401,16 +403,16 @@ AS SELECT * FROM source_view;
 8. 不新增 warning；现有 Pytest class-scope fixture deprecation warning 应在升级
    Pytest 10 前清理。
 
-上述标准描述当前已执行的候选范围，并不把第 5 节标记“待补”的增强项伪装成
-已完成。若要对外声称“第 5 节全部场景已覆盖”，必须先补齐 INC-001、INC-002、
-INC-053、INC-063、INC-069、INC-071；当前只能声明下述精确套件与证据通过。
+第 5 节当前登记的场景均已有自动化覆盖：表中标记 E2E 的项目进入下述五版本
+Functional/聚焦矩阵，只标记 Unit 的项目由同一候选 SHA 的 324 项 Unit 结果覆盖。
+新增场景时必须先补测试，再扩大对外声明范围。
 
 对外声明一个 Doris 版本通过兼容验证前，该版本还必须满足：
 
 1. 官方发行包 SHA-512 校验通过，且报告记录完整文件名和两个 Digest；
 2. 所有 FE/BE 均是矩阵中的同一个精确版本，并保存完整 build string；
 3. JDK、Adapter SHA、dirty 状态、dbt Core、Python、架构和 Endpoint 均已记录；
-4. 完整 Functional 恰好 88 passed，聚焦 Incremental 恰好 26 passed；
+4. 完整 Functional 恰好 92 passed，聚焦 Incremental 恰好 30 passed；
 5. 三个内置策略、MOW/MOR、Sequence、Overwrite 和 Full Refresh 关键断言通过；
 6. 测试对象、进程和端口清理复查通过；
 7. `DORIS_TEST_EXPECTED_VERSION` Gate 已拒绝 `0.0.0`，并证明所有存活 FE/BE
@@ -444,11 +446,12 @@ INC-053、INC-063、INC-069、INC-071；当前只能声明下述精确套件与�
 
 ### 8.2 当前设计验证
 
-Durable Marker 与 Pre-model Snapshot Ordering 的最终实现已完成本地验证：
+Durable Marker、Pre-model Snapshot Ordering 与 Incremental 边界用例的最终候选
+已完成本地验证：
 
 | 套件 | 最终结果 |
 | --- | --- |
-| Unit Test | 324 passed，9 warnings，26.71s |
+| Unit Test | 324 passed，9 warnings，31.28s |
 | Flake8 | passed |
 | `git diff --check` | passed |
 | `python -m build` | passed；在 `/tmp/dbt-doris-package-clean.tUhMxp` 生成 `dbt_doris-1.0.0` sdist 与 wheel |
@@ -461,6 +464,10 @@ Durable Marker 与 Pre-model Snapshot Ordering 的最终实现已完成本地验
 `259b14e0ff77c1dac4c1963b918e0612b2901358` 的本轮审计，仅用于证明被测输入；后续
 纯文档提交或正式发布构建会改变归档字节，不能把这里的 SHA-256 当成未来发行包
 必须复现的 Digest。
+
+Unit 与五版本 E2E 绑定测试提交
+`fd4a9471d68a0ea4d02cd96875eee3983554c118`；该提交只在上述实现上补充测试，不改变
+打包进 wheel 的 Adapter 运行时代码。
 
 运行环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.12.13。完整 Functional
 与聚焦 Incremental 的正式结果按版本登记在第 8.4 节。此前 Unit 321 与开发
@@ -484,27 +491,29 @@ Snapshot 改变了类型切换与恢复路径，因此它们全部失效，不�
 ### 8.4 正式版本结果登记
 
 截至 2026-08-03，最终 CTAS Snapshot + Durable Marker + Pre-model Ordering
-候选的五个正式版本均已通过：
+实现及完整 Incremental 边界用例在五个正式版本上均已通过：
 
 | Doris | FE/BE 完整 Version | 完整 Functional | 聚焦 Incremental | 状态 |
 | --- | --- | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 88 passed / 106 warnings / 96.64s | 26 passed / 27 warnings / 21.49s | passed |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 88 passed / 106 warnings / 96.59s | 26 passed / 27 warnings / 21.79s | passed |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 88 passed / 106 warnings / 99.73s | 26 passed / 27 warnings / 22.46s | passed |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 88 passed / 106 warnings / 99.05s | 26 passed / 27 warnings / 22.26s | passed |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 88 passed / 106 warnings / 99.16s | 26 passed / 27 warnings / 22.79s | passed |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed / 106 warnings / 114.19s | 30 passed / 27 warnings / 28.48s | passed |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed / 106 warnings / 116.70s | 30 passed / 27 warnings / 29.45s | passed |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed / 106 warnings / 117.16s | 30 passed / 27 warnings / 30.53s | passed |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed / 106 warnings / 120.79s | 30 passed / 27 warnings / 29.01s | passed |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed / 106 warnings / 111.72s | 30 passed / 27 warnings / 29.92s | passed |
 
-本节的 `passed` 范围严格限定为上表两套实际运行的测试、精确版本 Gate、Artifact
-与清理证据；第 5 节六个明确的增强项不包含在该状态内。
+本节的 `passed` 范围严格限定为上表两套实际运行的 E2E、精确版本 Gate、Artifact
+与清理证据。第 5 节标记为 Unit-only 的检查不表示在每个 Doris 版本上单独执行，
+它们由同一干净候选的 324 项 Unit 结果覆盖。
 
 每个版本均记录 FE/BE 完整 Version 完全一致、所有节点 `Alive=true`、测试数据库
 残留 0、Helper Relation 残留 0。2.1.11 暴露的调用 Session `sql_mode` 问题已由
 Pre-model Ordering 修复，该版本的聚焦与完整运行均通过。Adapter 证据记录为
-Git SHA `259b14e0ff77c1dac4c1963b918e0612b2901358`、dirty=`false`。每份版本 JSON
-均包含 `doris_version_gate`：`expected_release` 对应矩阵版本、
+Git SHA `fd4a9471d68a0ea4d02cd96875eee3983554c118`、dirty=`false`。每份 Functional
+和聚焦日志开头的 `DORIS_E2E_VERSION_EVIDENCE` JSON 均包含
+`doris_version_gate`：`expected_release` 对应矩阵版本、
 `reported_build` 对应上表完整 FE/BE Version、`status=passed`。运行日志目录
 模式为
-`/tmp/dbt-doris-version-e2e/evidence/<version>/{functional.log,incremental.log,cleanup.log}`；
+`/tmp/dbt-doris-version-e2e/evidence-fd4a947/<version>/{functional.log,incremental.log,cleanup.log,version.log}`；
 这是运行时审计位置，不是仓库内链接。Package Test 的最终结果见第 8.2 节。
 
 此前从 dirty 工作树执行的五版本运行只用于预验证，现作为历史记录保留；它不是
@@ -564,8 +573,8 @@ adapter:
   python_version: ""
 
 tests:
-  full_functional: ""       # 必须为 88 passed
-  focused_incremental: ""   # 必须为 26 passed
+  full_functional: ""       # 当前候选必须为 92 passed
+  focused_incremental: ""   # 当前候选必须为 30 passed
   key_incremental_checks: ""
 
 cleanup:
