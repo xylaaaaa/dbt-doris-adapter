@@ -1,24 +1,8 @@
 # dbt-doris 异步物化视图专项测试说明与执行记录
 
-## 1. 文档目的
+## 1. 被测代码与环境
 
-本文只描述 `materialized='materialized_view'` 对应的 Doris Async Materialized
-View 测试，不包含 Incremental、普通 Table/View、Doris Sync Materialized View
-（Rollup）或整个 Adapter 的泛化测试说明。
-
-本文同时回答四个问题：
-
-1. 五版本兼容性结论具体执行了哪些测试；
-2. 每个测试怎样操作 Doris、断言什么结果；
-3. 如何在另一套 Doris 环境复现；
-4. 哪些边界尚未通过真实 Doris E2E 覆盖。
-
-版本兼容性结论只依据第 5 节列出的 **21 个真实 Doris Functional Case**。单元
-测试用于补充异常和边界分支，不能代替真实 Doris 版本验证。
-
-## 2. 被测代码与环境
-
-### 2.1 被测代码
+### 1.1 被测代码
 
 | 项目 | 值 |
 | --- | --- |
@@ -33,7 +17,7 @@ View 测试，不包含 Incremental、普通 Table/View、Doris Sync Materialize
 Functional 文件或 `test/unit/test_materialized_view.py`，因此本报告仍对应当前
 MV 实现；如果以后这些文件发生变化，必须重新执行本测试。
 
-### 2.2 Doris 集群形态
+### 1.2 Doris 集群形态
 
 每个版本都重新解压官方二进制包并启动一套隔离集群：
 
@@ -53,7 +37,7 @@ MV 实现；如果以后这些文件发生变化，必须重新执行本测试�
 版本开始测试前都要求 `SHOW FRONTENDS` 和 `SHOW BACKENDS` 中的节点
 `Alive=true`，且 FE/BE 完整 Version 一致。
 
-### 2.3 官方包与 SHA-512
+### 1.3 官方包与 SHA-512
 
 | Doris | 官方包 SHA-512 |
 | --- | --- |
@@ -63,7 +47,7 @@ MV 实现；如果以后这些文件发生变化，必须重新执行本测试�
 | 4.0.7 | `c0e12a536a154482ad26055f459ed46fd6c705e20d5e171234c547ccdd2dd508be3d444002094b850b4adaa712489b3350a77a3fd76404681aca948f1fce3d27` |
 | 4.1.3 | `265ea3324ac9db59e97bfcca452d287ae8f48f23dbdc010cafa8b32667a69adff7d4251d06d22dbf9918dc74af5b12f8655a81b6cb99152e60e45246167beab6` |
 
-## 3. 测试入口与用例数量
+## 2. 测试入口与用例数量
 
 五个版本都执行相同的三个文件：
 
@@ -85,8 +69,10 @@ python -m pytest --collect-only -q \
 
 结果为 `21 tests collected`。下文每一行对应一个 pytest Item；一个 Item 内可能
 包含多次 `dbt run` 和多个生命周期阶段，阶段不会拆成虚假的额外 Case 数。
+版本兼容性结论只依据这 21 个真实 Doris Functional Case；单元测试只补充异常和
+边界分支，不能代替真实 Doris 版本验证。
 
-## 4. E2E 使用的 Doris 观测面
+## 3. E2E 使用的 Doris 观测面
 
 测试不是只判断 `dbt run` 退出码。每个场景按需要使用以下 Doris SQL 验证真实
 对象、任务和数据：
@@ -118,9 +104,9 @@ Refresh 后查询 `tasks('type'='mv')`，选择不在旧集合里的新任务，
 `PENDING/RUNNING`。Functional Test 只有在新任务最终为 `SUCCESS` 时通过；故意
 制造的失败任务必须为 `FAILED` 且带有预期错误。
 
-## 5. 21 个真实 Doris Functional Case
+## 4. 21 个真实 Doris Functional Case
 
-### 5.1 dbt-doris 生命周期专项：11 个
+### 4.1 dbt-doris 生命周期专项：11 个
 
 #### MV-E2E-001：Deferred Manual 创建、重复运行与数据刷新
 
@@ -235,7 +221,7 @@ Refresh 后查询 `tasks('type'='mv')`，选择不在旧集合里的新任务，
 - 断言：最终类型为 Table、数据行数仍为 2、Helper 全部清理。
 - 顺序二：继续验证 `Table → View → Table`，每步类型、数据和清理都正确。
 
-### 5.2 dbt Core 官方 MaterializedViewBasic 合约：8 个
+### 4.2 dbt Core 官方 MaterializedViewBasic 合约：8 个
 
 这八个 Case 直接继承 dbt Core 1.12 的 `MaterializedViewBasic`，Doris 子类只实现
 插入数据、显式 Refresh、统计行数和 Relation Type 查询。每个 Case 开始前运行
@@ -287,7 +273,7 @@ Seed 并用 `--full-refresh` 建立干净 MV，结束后重建测试 Schema。
 - 断言：底表行数在 Insert 后增加；MV 行数在 Refresh 前不变，只在 Refresh Task
   成功后增加。
 
-### 5.3 Docs、Source、Alias、Schema：2 个
+### 4.3 Docs、Source、Alias、Schema：2 个
 
 #### MV-E2E-020：`persist_docs` Relation/Column 开关及文档变更重建
 
@@ -311,11 +297,11 @@ Seed 并用 `--full-refresh` 建立干净 MV，结束后重建测试 Schema。
   和依赖关系与运行结果一致。
 - 清理：Case 结束时强制删除自定义 Schema 并清理 Adapter Cache。
 
-## 6. 五版本执行方法
+## 5. 五版本执行方法
 
-### 6.1 启动和版本确认
+### 5.1 启动和版本确认
 
-每个版本使用刚解压的官方包，配置第 2.2 节端口和副本数后启动 FE/BE，并把 BE
+每个版本使用刚解压的官方包，配置第 1.2 节端口和副本数后启动 FE/BE，并把 BE
 加入 FE：
 
 ```sql
@@ -334,7 +320,7 @@ DORIS_E2E_VERSION_EVIDENCE={...}
 设置 `DORIS_TEST_EXPECTED_VERSION` 后，如果实际版本不匹配，Fixture 在执行第一个
 Case 前直接失败，避免连错集群得到虚假绿灯。
 
-### 6.2 pytest 命令
+### 5.2 pytest 命令
 
 下面以 4.1.3 为例；其他版本只替换 Expected Version 和 Schema 前缀：
 
@@ -365,7 +351,7 @@ PYTHONPATH=/tmp/dbt-doris-adapter \
 | 4.0.7 | `4.0.7` | `dbt_adapter_mv_407_e2e` |
 | 4.1.3 | `4.1.3` | `dbt_adapter_mv_413_e2e` |
 
-## 7. 实际执行结果
+## 6. 实际执行结果
 
 | Doris | FE/BE 完整 Version | 结果 | Skip | 耗时 |
 | --- | --- | ---: | ---: | ---: |
@@ -391,7 +377,7 @@ PYTHONPATH=/tmp/dbt-doris-adapter \
 /mnt/disk1/chenjunwei/dbt-doris-mv-version-e2e/evidence/artifacts.sha512
 ```
 
-## 8. 清理验证
+## 7. 清理验证
 
 pytest 完成后，每个版本重新启动其 FE 元数据并执行：
 
@@ -403,7 +389,7 @@ SHOW DATABASES LIKE 'dbt_adapter_mv_<version>_e2e%';
 关闭。该结论只针对本专项测试创建的 Schema，不表示扫描或删除机器上其他用户的
 Doris 数据。
 
-## 9. 单元测试补充覆盖
+## 8. 单元测试补充覆盖
 
 真实 Doris E2E 之外，还执行：
 
@@ -425,14 +411,14 @@ pytest 展开为 118 个 Item。它们补充覆盖：
 - MV Relation Listing、Catalog Type、缺失 Schema；
 - FE 版本解析、Connected/Master FE 选择和版本 Gate。
 
-这些是无真实 Doris 的单元测试，不计入第 7 节的 105 个版本 E2E 结果。精确 Item
+这些是无真实 Doris 的单元测试，不计入第 6 节的 105 个版本 E2E 结果。精确 Item
 列表可用下面命令获取：
 
 ```bash
 python -m pytest --collect-only -q test/unit/test_materialized_view.py
 ```
 
-## 10. 本轮没有覆盖的边界
+## 9. 本轮没有覆盖的边界
 
 以下能力不能从本轮 21 个 E2E 得出“已验证”结论：
 
@@ -451,7 +437,7 @@ python -m pytest --collect-only -q test/unit/test_materialized_view.py
 - 2.1.5、3.0.0 或任意未列出的 Doris 精确版本；版本 Gate 单测不等于功能兼容
   E2E。
 
-## 11. 版本通过标准与结论
+## 10. 版本通过标准与结论
 
 一个 Doris 版本只有同时满足以下条件，才能加入 MV “已验证版本”表：
 
