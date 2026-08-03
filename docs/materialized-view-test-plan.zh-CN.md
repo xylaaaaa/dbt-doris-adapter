@@ -273,61 +273,7 @@ Seed 并用 `--full-refresh` 建立干净 MV，结束后重建测试 Schema。
   和依赖关系与运行结果一致。
 - 清理：Case 结束时强制删除自定义 Schema 并清理 Adapter Cache。
 
-## 5. 五版本执行方法
-
-### 5.1 启动和版本确认
-
-每个版本使用刚解压的官方包，配置第 1.2 节端口和副本数后启动 FE/BE，并把 BE
-加入 FE：
-
-```sql
-ALTER SYSTEM ADD BACKEND '172.20.32.136:21050';
-SHOW FRONTENDS;
-SHOW BACKENDS;
-```
-
-只有 FE/BE 均为 `Alive=true` 且完整 Version 对应该行发行版时才开始 pytest。
-测试 Session 的 Autouse Fixture 会再次读取版本并输出：
-
-```text
-DORIS_E2E_VERSION_EVIDENCE={...}
-```
-
-设置 `DORIS_TEST_EXPECTED_VERSION` 后，如果实际版本不匹配，Fixture 在执行第一个
-Case 前直接失败，避免连错集群得到虚假绿灯。
-
-### 5.2 pytest 命令
-
-下面以 4.1.3 为例；其他版本只替换 Expected Version 和 Schema 前缀：
-
-```bash
-cd /tmp/dbt-doris-adapter
-
-DORIS_TEST_HOST=127.0.0.1 \
-DORIS_TEST_PORT=21030 \
-DORIS_TEST_USER=root \
-DORIS_TEST_PASSWORD='' \
-DORIS_TEST_SCHEMA=dbt_adapter_mv_413_e2e \
-DORIS_TEST_REPLICATION_NUM=1 \
-DORIS_TEST_EXPECTED_VERSION=4.1.3 \
-PYTHONPATH=/tmp/dbt-doris-adapter \
-/tmp/dbt-doris-112-preflight.taXtaw/.venv/bin/python -m pytest -vv \
-  test/functional/adapter/test_doris_materialized_view.py \
-  test/functional/adapter/test_doris_materialized_view_basic.py \
-  test/functional/adapter/test_doris_materialized_view_complete.py
-```
-
-五版本使用的 Schema 前缀分别为：
-
-| Doris | `DORIS_TEST_EXPECTED_VERSION` | `DORIS_TEST_SCHEMA` |
-| --- | --- | --- |
-| 2.1.11 | `2.1.11` | `dbt_adapter_mv_2111_e2e` |
-| 3.0.8 | `3.0.8` | `dbt_adapter_mv_308_e2e` |
-| 3.1.4 | `3.1.4` | `dbt_adapter_mv_314_e2e` |
-| 4.0.7 | `4.0.7` | `dbt_adapter_mv_407_e2e` |
-| 4.1.3 | `4.1.3` | `dbt_adapter_mv_413_e2e` |
-
-## 6. 实际执行结果
+## 5. 实际执行结果
 
 | Doris | FE/BE 完整 Version | 结果 | Skip | 耗时 |
 | --- | --- | ---: | ---: | ---: |
@@ -347,7 +293,7 @@ PYTHONPATH=/tmp/dbt-doris-adapter \
 └── cleanup.log           # 对应测试 Schema 前缀的残留检查
 ```
 
-## 7. 清理验证
+## 6. 清理验证
 
 pytest 完成后，每个版本重新启动其 FE 元数据并执行：
 
@@ -359,7 +305,7 @@ SHOW DATABASES LIKE 'dbt_adapter_mv_<version>_e2e%';
 关闭。该结论只针对本专项测试创建的 Schema，不表示扫描或删除机器上其他用户的
 Doris 数据。
 
-## 8. 单元测试补充覆盖
+## 7. 单元测试补充覆盖
 
 真实 Doris E2E 之外，还执行：
 
@@ -381,9 +327,9 @@ pytest 展开为 118 个 Item。它们补充覆盖：
 - MV Relation Listing、Catalog Type、缺失 Schema；
 - FE 版本解析、Connected/Master FE 选择和版本 Gate。
 
-这些是无真实 Doris 的单元测试，不计入第 6 节的 105 个版本 E2E 结果。
+这些是无真实 Doris 的单元测试，不计入第 5 节的 105 个版本 E2E 结果。
 
-## 9. 本轮没有覆盖的边界
+## 8. 本轮没有覆盖的边界
 
 以下能力不能从本轮 21 个 E2E 得出“已验证”结论：
 
@@ -402,7 +348,7 @@ pytest 展开为 118 个 Item。它们补充覆盖：
 - 2.1.5、3.0.0 或任意未列出的 Doris 精确版本；版本 Gate 单测不等于功能兼容
   E2E。
 
-## 10. 版本通过标准与结论
+## 9. 版本通过标准与结论
 
 一个 Doris 版本只有同时满足以下条件，才能加入 MV “已验证版本”表：
 
