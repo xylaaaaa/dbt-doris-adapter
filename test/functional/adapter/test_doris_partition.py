@@ -66,6 +66,16 @@ select * from dbt_partition_intentional_missing_relation
 """
 
 
+def _partition_helper_relations(project, relation):
+    return project.run_sql(
+        "select table_name from information_schema.tables "
+        f"where table_schema = '{relation.schema}' "
+        f"and table_name like '{relation.identifier}__dbt_%' "
+        "order by table_name",
+        fetch="all",
+    )
+
+
 class TestDorisPartitionReplace:
     @pytest.fixture(scope="class")
     def models(self):
@@ -90,6 +100,26 @@ class TestDorisPartitionReplace:
             (2, "unchanged_partition_2"),
         ]
 
+        temp_name = f"{relation.identifier}__dbt_tmp"
+        backup_name = f"{relation.identifier}__dbt_backup"
+        project.run_sql(
+            f"create view `{relation.schema}`.`{temp_name}` as "
+            "select -1 as sentinel"
+        )
+        project.run_sql(
+            f"create table `{relation.schema}`.`{backup_name}` "
+            "(`sentinel` int) duplicate key(`sentinel`) "
+            "distributed by hash(`sentinel`) buckets 1 "
+            'properties ("replication_num" = "1")'
+        )
+        project.run_sql(
+            f"insert into `{relation.schema}`.`{backup_name}` values (-2)"
+        )
+        assert _partition_helper_relations(project, relation) == [
+            (backup_name,),
+            (temp_name,),
+        ]
+
         second_run = run_dbt(["run"])
         assert len(second_run) == 1
 
@@ -101,11 +131,19 @@ class TestDorisPartitionReplace:
             (1, "new_partition_1"),
             (2, "unchanged_partition_2"),
         ]
+        assert _partition_helper_relations(project, relation) == []
 
-        backup_name = f"{relation.identifier}__dbt_backup"
         project.run_sql(
             f"alter table {relation} rename `{backup_name}`"
         )
+        project.run_sql(
+            f"create view `{relation.schema}`.`{temp_name}` as "
+            "select -3 as sentinel"
+        )
+        assert _partition_helper_relations(project, relation) == [
+            (backup_name,),
+            (temp_name,),
+        ]
         set_model_file(project, relation, PARTITION_FAILURE_SQL)
         failure = run_dbt(["run"], expect_pass=False)
         assert len(failure.results) == 1
@@ -123,6 +161,15 @@ class TestDorisPartitionReplace:
             (1, "new_partition_1"),
             (2, "unchanged_partition_2"),
         ]
+        assert project.run_sql(
+            "select table_type from information_schema.tables "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name = '{backup_name}'",
+            fetch="one",
+        )[0] == "BASE TABLE"
+        assert _partition_helper_relations(project, relation) == [
+            (backup_name,),
+        ]
 
         # A second retry must still compile as a full build. Publishing the
         # backup at the canonical name before the failed run would make
@@ -139,10 +186,4 @@ class TestDorisPartitionReplace:
             (2, "unchanged_partition_2"),
         ]
 
-        temporary_relations = project.run_sql(
-            "select table_name from information_schema.tables "
-            f"where table_schema = '{relation.schema}' "
-            "and table_name like 'partition_replace__dbt_%'",
-            fetch="all",
-        )
-        assert temporary_relations == []
+        assert _partition_helper_relations(project, relation) == []
