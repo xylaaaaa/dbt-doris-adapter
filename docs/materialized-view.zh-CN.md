@@ -17,21 +17,25 @@ dbt Core 的开发与测试基线是 1.12.x。每次管理 Async MV 前，Adapte
 直接失败。当前代码 Gate 接受 2.x 中不低于 2.1.5 的版本、除 3.0.0 外的
 3.x，以及主版本 4 及以上。
 
-Async MV 生命周期已经在以下五个 Doris 官方发行版本的完整 Adapter Functional
-套件中通过：
+Async MV 生命周期已经在以下五个 Doris 官方发行版本上直接运行同一组 21 项
+专项 Functional Test；每个版本均全部通过且没有 Skip：
 
-| Doris | FE/BE 完整 Version | Async MV 状态 |
+| Doris | FE/BE 完整 Version | MV 专项结果 |
 | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 已验证 |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 已验证 |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 已验证 |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 已验证 |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 已验证 |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 21 passed / 121.07s |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 21 passed / 118.73s |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 21 passed / 105.66s |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 21 passed / 105.94s |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 21 passed / 109.19s |
 
-被测 Adapter 提交为 `fd4a9471d68a0ea4d02cd96875eee3983554c118`、
-`dirty=false`；环境为 dbt Core 1.12.0、dbt-doris 1.0.0、Python 3.12.13。
-五个版本的 FE/BE 完整 Version 均一致且 `Alive=true`，测试数据库和 Helper
-Relation 残留均为 0。
+专项测试直接运行
+`test_doris_materialized_view.py`、`test_doris_materialized_view_basic.py` 和
+`test_doris_materialized_view_complete.py`，覆盖 Adapter 自有生命周期场景和 dbt
+官方 Materialized View 基础 Contract。被测 Adapter 提交为
+`f5e30c64ef7eb8320cf359c3d96cf62b595faf00`、测试开始时 `dirty=false`；环境为
+dbt Core 1.12.0、dbt-doris 1.0.0、Python 3.11.15、pytest 8.4.2。五个版本均使用
+单 FE/BE、`replication_num=1`，FE/BE 完整 Version 一致且 `Alive=true`；测试后
+对应数据库残留均为 0。共执行 105 项 MV Functional Test，105 项通过。
 
 这组边界是代码中人为设置的运行条件，不是多版本 E2E 得出的最低/排除版本结论。
 当前证据证明的是上表五个精确版本，仍没有证明 2.1.5 是准确最低版本或 3.0.0

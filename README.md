@@ -21,18 +21,19 @@ dbt Labs release.
 The release-candidate E2E matrix is deliberately pinned to exact public
 artifacts:
 
-| Doris release | Exact FE/BE Version | Complete Functional | Focused Incremental | State |
-| --- | --- | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed, 106 warnings, 114.19s | 30 passed, 27 warnings, 28.48s | Passed |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed, 106 warnings, 116.70s | 30 passed, 27 warnings, 29.45s | Passed |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed, 106 warnings, 117.16s | 30 passed, 27 warnings, 30.53s | Passed |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed, 106 warnings, 120.79s | 30 passed, 27 warnings, 29.01s | Passed |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed, 106 warnings, 111.72s | 30 passed, 27 warnings, 29.92s | Passed |
+| Doris release | Exact FE/BE Version | Complete Functional | Focused Incremental | Focused Async MV | State |
+| --- | --- | --- | --- | --- | --- |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed, 106 warnings, 114.19s | 30 passed, 27 warnings, 28.48s | 21 passed, 121.07s | Passed |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed, 106 warnings, 116.70s | 30 passed, 27 warnings, 29.45s | 21 passed, 118.73s | Passed |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed, 106 warnings, 117.16s | 30 passed, 27 warnings, 30.53s | 21 passed, 105.66s | Passed |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed, 106 warnings, 120.79s | 30 passed, 27 warnings, 29.01s | 21 passed, 105.94s | Passed |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed, 106 warnings, 111.72s | 30 passed, 27 warnings, 29.92s | 21 passed, 109.19s | Passed |
 
 Here, `Passed` means that the exact release completed the recorded 92-test
-Functional suite, the 30-test focused Incremental suite, and the version and
-cleanup evidence checks. The focused suite now includes INC-001, INC-002,
-INC-053, INC-063, INC-069, and INC-071 from the test plan.
+Functional suite, the 30-test focused Incremental suite, the 21-test focused
+Async MV suite, and the version and cleanup evidence checks. The Async MV suite
+ran the adapter lifecycle tests plus dbt Core's Materialized View basic
+contract, with no skipped cases.
 
 Each completed row requires SHA-512 verification of the downloaded artifact, the
 same complete Version string matching the expected release on every live FE and
@@ -359,6 +360,7 @@ Asynchronous-MV version evidence is:
 | Current redesign validation | Clean commit `fd4a9471d68a0ea4d02cd96875eee3983554c118`, `dirty=false`; Unit: 324 passed, 9 warnings, 31.28s; Flake8 and diff check passed | Local code, macro, and completed edge-case validation for the final implementation |
 | Package validation | `dbt_doris-1.0.0` sdist and wheel built; both passed Twine; clean Python 3.12 wheel install and `pip check` passed | The published package shape includes the adapter and checked macros and has consistent dependencies |
 | Official-release E2E matrix | 2.1.11, 3.0.8, 3.1.4, 4.0.7, and 4.1.3 each passed all 92 Functional and 30 focused Incremental tests | The final implementation and completed Incremental edge-case suite passed on those exact official-release builds |
+| Focused Async MV E2E matrix | Clean commit `f5e30c64ef7eb8320cf359c3d96cf62b595faf00`, `dirty=false`; the same 21 MV tests passed without skips on 2.1.11, 3.0.8, 3.1.4, 4.0.7, and 4.1.3 | Async MV creation, refresh policy, task waiting, configuration change, rollback, docs, custom schema/alias, and relation-type switching passed on those exact builds |
 | Unit tests with mocked `SHOW FRONTENDS` rows | 2.1.5, 2.1.10, 3.0.1, 3.1.0, and 4.1.2 | Version parsing and gate decisions only; no Doris feature compatibility |
 
 Before managing an asynchronous MV, the adapter prefers the connected and

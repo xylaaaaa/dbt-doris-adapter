@@ -169,6 +169,11 @@ View，不作为 Incremental Strategy。
   2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 均为完整 Functional 92 passed、聚焦
   Incremental 30 passed。各版本 FE/BE 完整 Version 完全一致且 `Alive=true`，
   测试数据库与 Helper Relation 残留均为 0。
+- Async MV 又在上述五个精确版本直接运行相同的 21 项专项 Functional Test：
+  各版本均为 21 passed、无 Skip，耗时依次为 121.07s、118.73s、105.66s、
+  105.94s、109.19s；测试后对应数据库残留均为 0。被测 Adapter SHA 为
+  `f5e30c64ef7eb8320cf359c3d96cf62b595faf00`，测试开始时 `dirty=false`，环境为
+  dbt Core 1.12.0、Python 3.11.15 和 pytest 8.4.2。
 - INC-001、INC-002、INC-053、INC-063、INC-069、INC-071 已补入五版本 E2E；
   测试计划当前登记的 Incremental 场景全部自动化。
 - 五版本完整 Functional 的 warnings/耗时依次为 `106/114.19s`、

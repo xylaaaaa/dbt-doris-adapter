@@ -518,15 +518,15 @@ Replace 后 Post-hook 失败时保留旧 MV，并在下次运行先原子回滚�
 
 ### 6.4 版本 Gate 与验证状态
 
-| Doris | FE/BE 完整 Version | 完整 Functional | 聚焦 Incremental | 状态 |
-| --- | --- | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed / 106 warnings / 114.19s | 30 passed / 27 warnings / 28.48s | passed |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed / 106 warnings / 116.70s | 30 passed / 27 warnings / 29.45s | passed |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed / 106 warnings / 117.16s | 30 passed / 27 warnings / 30.53s | passed |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed / 106 warnings / 120.79s | 30 passed / 27 warnings / 29.01s | passed |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed / 106 warnings / 111.72s | 30 passed / 27 warnings / 29.92s | passed |
+| Doris | FE/BE 完整 Version | 完整 Functional | 聚焦 Incremental | 聚焦 Async MV | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed / 106 warnings / 114.19s | 30 passed / 27 warnings / 28.48s | 21 passed / 121.07s | passed |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed / 106 warnings / 116.70s | 30 passed / 27 warnings / 29.45s | 21 passed / 118.73s | passed |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed / 106 warnings / 117.16s | 30 passed / 27 warnings / 30.53s | 21 passed / 105.66s | passed |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed / 106 warnings / 120.79s | 30 passed / 27 warnings / 29.01s | 21 passed / 105.94s | passed |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed / 106 warnings / 111.72s | 30 passed / 27 warnings / 29.92s | 21 passed / 109.19s | passed |
 
-这里的 `passed` 只覆盖上表两套实际运行的测试、版本身份和清理证据；测试方案中
+这里的 `passed` 只覆盖上表三套实际运行的测试、版本身份和清理证据；测试方案中
 当前登记的 Incremental 场景（包括 INC-001、INC-002、INC-053、INC-063、
 INC-069、INC-071）均已自动化。
 
@@ -537,6 +537,11 @@ Relation 残留均为 0。环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.1
 聚焦日志开头的 `DORIS_E2E_VERSION_EVIDENCE` JSON 均记录匹配该行的
 `expected_release`、完整 `reported_build` 与 `status=passed`。Unit 为
 324 passed / 9 warnings / 31.28s，Flake8 和 diff check 均通过。
+
+聚焦 Async MV 套件直接运行三个 MV Functional 文件，共 21 项，覆盖 Adapter
+生命周期用例和 dbt 官方 Materialized View 基础 Contract。它使用 Adapter SHA
+`f5e30c64ef7eb8320cf359c3d96cf62b595faf00`、测试开始时 `dirty=false`、dbt Core
+1.12.0、Python 3.11.15、pytest 8.4.2；五个版本均无 Skip，测试数据库残留为 0。
 
 Package 干净输出 `/tmp/dbt-doris-package-clean.tUhMxp` 中，75,660-byte wheel
 SHA-256 为 `edcbc1bae94e440c7be25f71ec96b6c91e4a5e71af29604561f4d99264584725`，
