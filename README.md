@@ -389,6 +389,12 @@ record the delivered scope and remaining adapter work.
 
 ## Test
 
+The adapter-wide strategy, including the upstream dbt Adapter contract suites,
+Doris-specific feature tests, version matrix, and release gates, is documented
+in [docs/dbt-doris-test-plan.zh-CN.md](docs/dbt-doris-test-plan.zh-CN.md).
+The Incremental-specific case matrix remains in
+[docs/incremental-test-plan.zh-CN.md](docs/incremental-test-plan.zh-CN.md).
+
 Unit tests do not require a Doris cluster:
 
 ```shell
