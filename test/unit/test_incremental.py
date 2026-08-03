@@ -455,3 +455,64 @@ def test_cancelled_schema_change_is_reported(monkeypatch):
         adapter.wait_for_schema_change(relation, previous_job_id="1")
 
     assert "invalid type conversion" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("job", "expected_message"),
+    [
+        pytest.param(
+            {"job_id": "2", "state": "RUNNING", "message": ""},
+            (
+                "Timed out after 1 seconds waiting for Doris schema change "
+                "job 2 on `analytics`.`events` (state: RUNNING)"
+            ),
+            id="running-job",
+        ),
+        pytest.param(
+            {"job_id": "1", "state": "FINISHED", "message": ""},
+            (
+                "Timed out after 1 seconds waiting for a new Doris schema "
+                "change job on `analytics`.`events`"
+            ),
+            id="previous-job-still-visible",
+        ),
+        pytest.param(
+            None,
+            (
+                "Timed out after 1 seconds waiting for a new Doris schema "
+                "change job on `analytics`.`events`"
+            ),
+            id="new-job-not-visible",
+        ),
+    ],
+)
+def test_schema_change_timeout_is_reported(
+    monkeypatch,
+    job,
+    expected_message,
+):
+    adapter = object.__new__(DorisAdapter)
+    relation = DorisRelation.create(schema="analytics", identifier="events")
+    monkeypatch.setattr(
+        adapter,
+        "_latest_schema_change_job",
+        lambda _: job,
+    )
+    ticks = iter([100.0, 101.0])
+    monkeypatch.setattr(
+        "dbt.adapters.doris.impl.time.monotonic",
+        lambda: next(ticks),
+    )
+    monkeypatch.setattr(
+        "dbt.adapters.doris.impl.time.sleep",
+        lambda _: pytest.fail("schema-change timeout should not sleep"),
+    )
+
+    with pytest.raises(DbtRuntimeError) as excinfo:
+        adapter.wait_for_schema_change(
+            relation,
+            previous_job_id="1",
+            timeout_seconds=1,
+        )
+
+    assert expected_message in str(excinfo.value)

@@ -604,6 +604,41 @@ select cast(2 as int) as `ID`, cast('new' as varchar(20)) as `VALUE`
 """
 
 
+INCREMENTAL_SCHEMA_CHANGE_RETRY_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['id'],
+    on_schema_change='append_new_columns',
+    distributed_by=['id'],
+    properties={
+        'replication_num': '1',
+        'enable_unique_key_merge_on_write': 'true'
+    }
+) }}
+
+{% if not is_incremental() %}
+select cast(1 as int) as id, cast('original' as varchar(40)) as value
+{% elif var('emit_duplicate_keys', false) %}
+select cast(1 as int) as id,
+       cast('conflict_a' as varchar(40)) as value,
+       cast(10 as int) as added_value
+union all
+select cast(1 as int) as id,
+       cast('conflict_b' as varchar(40)) as value,
+       cast(20 as int) as added_value
+{% else %}
+select cast(1 as int) as id,
+       cast('updated' as varchar(40)) as value,
+       cast(30 as int) as added_value
+union all
+select cast(2 as int) as id,
+       cast('new' as varchar(40)) as value,
+       cast(40 as int) as added_value
+{% endif %}
+"""
+
+
 INCREMENTAL_CUSTOM_STRATEGY_SQL = """
 {{ config(
     materialized='incremental',
@@ -656,6 +691,20 @@ INCREMENTAL_RECOVERY_SQL = """
 
 select *
 from dbt_incremental_intentional_missing_relation
+"""
+
+
+INCREMENTAL_VIEW_PRE_HOOK_FAILURE_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='append',
+    duplicate_key=['id'],
+    distributed_by=['id'],
+    properties={'replication_num': '1'},
+    pre_hook='select * from __dbt_incremental_view_pre_hook__'
+) }}
+
+select 7 as id, 'new_table' as value
 """
 
 
@@ -743,6 +792,20 @@ INCREMENTAL_INVALID_GRANTS_SQL = """
 ) }}
 
 select 2 as id, 'must_not_be_written' as value
+"""
+
+
+INCREMENTAL_TARGET_GUARD_SQL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy=var('guard_strategy'),
+    unique_key=var('guard_unique_key', none),
+    distributed_by=['id'],
+    properties={'replication_num': '1'},
+    pre_hook='select * from __dbt_incremental_target_guard_hook__'
+) }}
+
+select 2 as id, 2 as tenant_id, 'must_not_be_written' as value
 """
 
 
@@ -1312,6 +1375,131 @@ class TestDorisIncrementalRejectsLegacyOverwriteUniqueKey:
         ) is None
 
 
+class TestDorisIncrementalTargetPreflight:
+    @classmethod
+    @pytest.fixture(scope="class")
+    def models(cls):
+        return {
+            "incremental_target_guard.sql": INCREMENTAL_TARGET_GUARD_SQL,
+        }
+
+    @pytest.mark.parametrize(
+        (
+            "target_table_tail",
+            "vars_yaml",
+            "expected_fragments",
+        ),
+        [
+            pytest.param(
+                (
+                    "unique key(`id`) "
+                    "distributed by hash(`id`) buckets 1 "
+                    'properties("replication_num" = "1", '
+                    '"enable_unique_key_merge_on_write" = "true")'
+                ),
+                "{guard_strategy: append}",
+                ("requires a duplicate key target", "is unique"),
+                id="append-rejects-unique-target",
+            ),
+            pytest.param(
+                (
+                    "duplicate key(`id`) "
+                    "distributed by hash(`id`) buckets 1 "
+                    'properties("replication_num" = "1")'
+                ),
+                "{guard_strategy: merge, guard_unique_key: [id]}",
+                ("requires a unique key target", "is duplicate"),
+                id="merge-rejects-duplicate-target",
+            ),
+            pytest.param(
+                (
+                    "unique key(`id`) "
+                    "distributed by hash(`id`) buckets 1 "
+                    'properties("replication_num" = "1", '
+                    '"enable_unique_key_merge_on_write" = "true")'
+                ),
+                (
+                    "{guard_strategy: merge, "
+                    "guard_unique_key: [tenant_id, id]}"
+                ),
+                ("configured unique_key", "physical unique key"),
+                id="merge-rejects-physical-key-mismatch",
+            ),
+        ],
+    )
+    def test_mismatch_fails_before_hooks_staging_and_dml(
+        self,
+        project,
+        target_table_tail,
+        vars_yaml,
+        expected_fragments,
+    ):
+        model_name = "incremental_target_guard"
+        relation = relation_from_name(project.adapter, model_name)
+
+        project.run_sql(f"drop table if exists {relation}")
+        project.run_sql(
+            f"create table {relation} ("
+            "`id` int, `tenant_id` int, `value` varchar(40)"
+            f") {target_table_tail}"
+        )
+        project.run_sql(f"insert into {relation} values (1, 1, 'original')")
+
+        ddl_before = project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1]
+        rows_before = project.run_sql(
+            f"select id, tenant_id, value from {relation} order by id",
+            fetch="all",
+        )
+        assert rows_before == [(1, 1, "original")]
+        assert _dbt_helper_relations(project, relation) == []
+
+        failure, statements = _run_and_capture_sql(
+            model_name,
+            [
+                "run",
+                "--select",
+                model_name,
+                "--vars",
+                vars_yaml,
+            ],
+            expect_pass=False,
+        )
+
+        assert len(failure.results) == 1
+        message = failure.results[0].message.lower()
+        for fragment in expected_fragments:
+            assert fragment in message
+
+        assert any("show create table" in sql for sql in statements)
+        assert not any(
+            "__dbt_incremental_target_guard_hook__" in sql
+            for sql in statements
+        )
+        assert not any(
+            "create or replace view" in sql and "__dbt_tmp" in sql
+            for sql in statements
+        )
+        _assert_no_physical_dbt_staging(statements)
+        assert _target_dml_statements(statements) == []
+        assert not any(
+            "alter table" in sql or "delete from" in sql
+            for sql in statements
+        )
+
+        assert project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1] == ddl_before
+        assert project.run_sql(
+            f"select id, tenant_id, value from {relation} order by id",
+            fetch="all",
+        ) == rows_before
+        assert _dbt_helper_relations(project, relation) == []
+
+
 class TestDorisIncrementalGrantPreflight:
     @pytest.fixture(scope="class")
     def models(self):
@@ -1695,6 +1883,139 @@ class TestDorisIncrementalCaseOnlySchemaChange:
         assert _dbt_helper_relations(project, relation) == []
 
 
+class TestDorisIncrementalSchemaChangeRetry:
+    @classmethod
+    @pytest.fixture(scope="class")
+    def models(cls):
+        return {
+            "incremental_schema_change_retry.sql": (
+                INCREMENTAL_SCHEMA_CHANGE_RETRY_SQL
+            ),
+        }
+
+    def test_alter_precedes_dml_and_retry_replaces_frozen_batch(self, project):
+        model_name = "incremental_schema_change_retry"
+        run_args = ["run", "--select", model_name]
+        relation = relation_from_name(project.adapter, model_name)
+        temp_name = f"{relation.identifier}__dbt_tmp"
+
+        initial, initial_statements = _run_and_capture_sql(
+            model_name,
+            run_args,
+        )
+        assert len(initial) == 1
+        _assert_direct_initial_ctas(initial_statements, model_name)
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [(1, "original")]
+        assert "`added_value`" not in project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1].lower()
+        assert _dbt_helper_relations(project, relation) == []
+
+        failure, statements = _run_and_capture_sql(
+            model_name,
+            run_args + ["--vars", "{emit_duplicate_keys: true}"],
+            expect_pass=False,
+        )
+
+        assert len(failure.results) == 1
+        failure_message = failure.results[0].message.lower()
+        assert "json" in failure_message
+        assert "parse" in failure_message
+        _assert_physical_staging(statements)
+        staging_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if "create table" in statement
+            and temp_name in statement
+            and " as " in statement
+        )
+        alter_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if "alter table" in statement
+            and relation.identifier in statement
+            and "add column" in statement
+        )
+        target_dml_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if statement in _target_dml_statements(statements)
+        )
+        assert staging_index < alter_index < target_dml_index
+        assert any(
+            alter_index < index < target_dml_index
+            and "show alter table column" in statement
+            for index, statement in enumerate(statements)
+        )
+        target_dml = _target_dml_statements(statements)[0]
+        assert "dbt_internal_duplicate_keys" in target_dml
+        assert "count(*) over" in target_dml
+        assert project.run_sql(
+            f"select id, value, added_value from {relation} order by id",
+            fetch="all",
+        ) == [(1, "original", None)]
+        assert "`added_value`" in project.run_sql(
+            f"show create table {relation}",
+            fetch="one",
+        )[1].lower()
+        assert _dbt_helper_relations(project, relation) == [(temp_name,)]
+        assert project.run_sql(
+            "select id, value, added_value "
+            f"from `{relation.schema}`.`{temp_name}` order by value",
+            fetch="all",
+        ) == [
+            (1, "conflict_a", 10),
+            (1, "conflict_b", 20),
+        ]
+
+        results, retry_statements = _run_and_capture_sql(
+            model_name,
+            run_args,
+        )
+        assert len(results) == 1
+        _assert_physical_staging(retry_statements)
+        stale_drop_index = next(
+            index
+            for index, statement in enumerate(retry_statements)
+            if "drop table if exists" in statement and temp_name in statement
+        )
+        new_staging_index = next(
+            index
+            for index, statement in enumerate(retry_statements)
+            if "create table" in statement
+            and temp_name in statement
+            and " as " in statement
+        )
+        assert stale_drop_index < new_staging_index
+        retry_dml_index = next(
+            index
+            for index, statement in enumerate(retry_statements)
+            if statement in _target_dml_statements(retry_statements)
+        )
+        assert any(
+            retry_dml_index < index
+            and "drop table if exists" in statement
+            and temp_name in statement
+            for index, statement in enumerate(retry_statements)
+        )
+        assert not any(
+            "alter table" in statement and "add column" in statement
+            for statement in retry_statements
+        )
+        assert project.run_sql(
+            f"select id, value, added_value from {relation} order by id",
+            fetch="all",
+        ) == [
+            (1, "updated", 30),
+            (2, "new", 40),
+        ]
+        assert _dbt_helper_relations(project, relation) == []
+
+
 class TestDorisIncrementalCustomStrategy:
     @pytest.fixture(scope="class")
     def models(self):
@@ -1963,6 +2284,157 @@ class TestDorisIncrementalBackupRecovery:
         )[1].lower().replace(" ", "")
         assert "duplicatekey(`id`)" in create_sql
         assert "distributedbyhash(`id`)" in create_sql
+        assert _dbt_helper_relations(project, relation) == []
+
+
+class TestDorisIncrementalViewReplacementFailures:
+    @classmethod
+    @pytest.fixture(scope="class")
+    def models(cls):
+        return {
+            "incremental_view_build_failure.sql": INCREMENTAL_RECOVERY_SQL,
+            "incremental_view_pre_hook_failure.sql": (
+                INCREMENTAL_VIEW_PRE_HOOK_FAILURE_SQL
+            ),
+        }
+
+    def test_snapshot_survives_replacement_build_failure_and_retry(
+        self,
+        project,
+    ):
+        model_name = "incremental_view_build_failure"
+        relation = relation_from_name(project.adapter, model_name)
+        backup_name = f"{relation.identifier}__dbt_backup"
+        project.run_sql(
+            f"create view {relation} as "
+            "select 99 as id, 'old_view' as value"
+        )
+        source_rows = project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        )
+
+        failure, statements = _run_and_capture_sql(
+            model_name,
+            ["run", "--select", model_name],
+            expect_pass=False,
+        )
+
+        assert len(failure.results) == 1
+        assert "dbt_incremental_intentional_missing_relation" in (
+            failure.results[0].message
+        )
+        snapshot_ctas = [
+            statement
+            for statement in statements
+            if "create table" in statement
+            and backup_name in statement
+            and f"select * from {relation}" in statement
+        ]
+        replacement_ctas = [
+            statement
+            for statement in statements
+            if "create table" in statement
+            and f"{relation.identifier}__dbt_tmp" in statement
+            and "dbt_incremental_intentional_missing_relation" in statement
+        ]
+        assert len(snapshot_ctas) == 1
+        assert len(replacement_ctas) == 1
+        assert statements.index(snapshot_ctas[0]) < statements.index(
+            replacement_ctas[0]
+        )
+        assert _target_dml_statements(statements) == []
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == source_rows
+        assert project.run_sql(
+            f"select id, value from `{relation.schema}`.`{backup_name}`",
+            fetch="all",
+        ) == source_rows
+        relation_types = project.run_sql(
+            "select table_name, table_type from information_schema.tables "
+            f"where table_schema = '{relation.schema}' "
+            f"and table_name in ('{relation.identifier}', '{backup_name}') "
+            "order by table_name",
+            fetch="all",
+        )
+        assert relation_types == [
+            (relation.identifier, "VIEW"),
+            (backup_name, "BASE TABLE"),
+        ]
+        assert _dbt_helper_relations(project, relation) == [(backup_name,)]
+
+        set_model_file(project, relation, INCREMENTAL_VIEW_DEFAULT_SQL)
+        retry = run_dbt(["run", "--select", model_name])
+        assert len(retry) == 1
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [(7, "new_table")]
+        assert _dbt_helper_relations(project, relation) == []
+
+    def test_snapshot_precedes_pre_hook_failure_and_retry(self, project):
+        model_name = "incremental_view_pre_hook_failure"
+        relation = relation_from_name(project.adapter, model_name)
+        backup_name = f"{relation.identifier}__dbt_backup"
+        project.run_sql(
+            f"create view {relation} as "
+            "select 99 as id, 'old_view' as value"
+        )
+        source_rows = project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        )
+
+        failure, statements = _run_and_capture_sql(
+            model_name,
+            ["run", "--select", model_name],
+            expect_pass=False,
+        )
+
+        assert len(failure.results) == 1
+        assert "__dbt_incremental_view_pre_hook__" in (
+            failure.results[0].message
+        )
+        snapshot_ctas = [
+            statement
+            for statement in statements
+            if "create table" in statement
+            and backup_name in statement
+            and f"select * from {relation}" in statement
+        ]
+        pre_hook_indexes = [
+            index
+            for index, statement in enumerate(statements)
+            if "__dbt_incremental_view_pre_hook__" in statement
+        ]
+        assert len(snapshot_ctas) == 1
+        assert len(pre_hook_indexes) == 1
+        assert statements.index(snapshot_ctas[0]) < pre_hook_indexes[0]
+        assert not any(
+            "create table" in statement
+            and f"{relation.identifier}__dbt_tmp" in statement
+            for statement in statements
+        )
+        assert _target_dml_statements(statements) == []
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == source_rows
+        assert project.run_sql(
+            f"select id, value from `{relation.schema}`.`{backup_name}`",
+            fetch="all",
+        ) == source_rows
+        assert _dbt_helper_relations(project, relation) == [(backup_name,)]
+
+        set_model_file(project, relation, INCREMENTAL_VIEW_DEFAULT_SQL)
+        retry = run_dbt(["run", "--select", model_name])
+        assert len(retry) == 1
+        assert project.run_sql(
+            f"select id, value from {relation}",
+            fetch="all",
+        ) == [(7, "new_table")]
         assert _dbt_helper_relations(project, relation) == []
 
 
