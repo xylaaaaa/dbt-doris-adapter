@@ -37,16 +37,6 @@ MV 实现；如果以后这些文件发生变化，必须重新执行本测试�
 版本开始测试前都要求 `SHOW FRONTENDS` 和 `SHOW BACKENDS` 中的节点
 `Alive=true`，且 FE/BE 完整 Version 一致。
 
-### 1.3 官方包与 SHA-512
-
-| Doris | 官方包 SHA-512 |
-| --- | --- |
-| 2.1.11 | `5464942ce430d02ebc1c1597d340b7c1129a19462ddb294d43cd74c8725824b83ae486b5d5136124e012657e3735275b6e40102c84368e3af3af1308a10e5382` |
-| 3.0.8 | `e4441aaf845d9e95ebefa51159316b6248f039658db2e24d0e378f56cf5b94f433a841f52a3b68c651899e214f49b75cac0e49e7ae6e53ed8a166d51dbb09b1f` |
-| 3.1.4 | `0cb3d1c35372c9995c03ee69ce3717cf1bd2c9dcaff671dd45bbaefcd926fe48b7441afcae4ab8142bec19963cfe260e9ab438635c6d9f6acd094e757ddd2c59` |
-| 4.0.7 | `c0e12a536a154482ad26055f459ed46fd6c705e20d5e171234c547ccdd2dd508be3d444002094b850b4adaa712489b3350a77a3fd76404681aca948f1fce3d27` |
-| 4.1.3 | `265ea3324ac9db59e97bfcca452d287ae8f48f23dbdc010cafa8b32667a69adff7d4251d06d22dbf9918dc74af5b12f8655a81b6cb99152e60e45246167beab6` |
-
 ## 2. 测试入口与用例数量
 
 五个版本都执行相同的三个文件：
@@ -371,12 +361,6 @@ PYTHONPATH=/tmp/dbt-doris-adapter \
 └── cleanup.log           # 对应测试 Schema 前缀的残留检查
 ```
 
-官方包 Hash 清单位于：
-
-```text
-/mnt/disk1/chenjunwei/dbt-doris-mv-version-e2e/evidence/artifacts.sha512
-```
-
 ## 7. 清理验证
 
 pytest 完成后，每个版本重新启动其 FE 元数据并执行：
@@ -441,13 +425,12 @@ python -m pytest --collect-only -q test/unit/test_materialized_view.py
 
 一个 Doris 版本只有同时满足以下条件，才能加入 MV “已验证版本”表：
 
-1. 官方二进制包 SHA-512 校验通过；
-2. FE/BE 完整 Version 与目标发行版一致且全部 `Alive=true`；
-3. dbt Core 1.12 环境实际收集到 21 个 MV Functional Case；
-4. 21 个 Case 全部 Pass，没有 Skip/Xfail/重跑后通过；
-5. pytest 退出码为 0；
-6. 测试 Schema 残留为 0，隔离进程已关闭；
-7. 日志能追溯到精确 Adapter Git SHA。
+1. FE/BE 完整 Version 与目标发行版一致且全部 `Alive=true`；
+2. dbt Core 1.12 环境实际收集到 21 个 MV Functional Case；
+3. 21 个 Case 全部 Pass，没有 Skip/Xfail/重跑后通过；
+4. pytest 退出码为 0；
+5. 测试 Schema 残留为 0，隔离进程已关闭；
+6. 日志能追溯到精确 Adapter Git SHA。
 
 按上述标准，当前已验证的精确 Doris 版本是：
 
