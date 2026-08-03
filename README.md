@@ -383,6 +383,9 @@ out of scope.
 
 The complete configuration and lifecycle guide is available in
 [docs/materialized-view.zh-CN.md](docs/materialized-view.zh-CN.md). The
+[Async MV test record](docs/materialized-view-test-plan.zh-CN.md) lists all 21
+live-Doris cases, the five-version execution procedure, results, and explicit
+coverage gaps. The
 [implementation TODO](docs/dbt-doris-todo-list.zh-CN.md) and
 [#65967 acceptance requirements](docs/dbt-doris-issue-65967-async-materialized-view-requirements.zh-CN.md)
 record the delivered scope and remaining adapter work.

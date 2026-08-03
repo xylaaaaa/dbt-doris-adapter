@@ -37,6 +37,9 @@ dbt Core 1.12.0、dbt-doris 1.0.0、Python 3.11.15、pytest 8.4.2。五个版本
 单 FE/BE、`replication_num=1`，FE/BE 完整 Version 一致且 `Alive=true`；测试后
 对应数据库残留均为 0。共执行 105 项 MV Functional Test，105 项通过。
 
+逐项测试步骤、21 个 Case 的完整断言、复现命令、原始证据位置和未覆盖边界见
+[异步物化视图专项测试说明与执行记录](materialized-view-test-plan.zh-CN.md)。
+
 这组边界是代码中人为设置的运行条件，不是多版本 E2E 得出的最低/排除版本结论。
 当前证据证明的是上表五个精确版本，仍没有证明 2.1.5 是准确最低版本或 3.0.0
 一定不兼容，因此本文不把 Gate 放行范围整体称为“支持版本范围”。此前

@@ -97,8 +97,10 @@ Doris 版本矩阵覆盖当前维护的 2.1、3.0、3.1、4.0 和 4.1 发布线�
 | dbt Unit Test | 用户项目中的 dbt unit test 能否通过 Adapter 执行 | `test_doris_unit_test.py` |
 
 Incremental 的完整输入组合、失败注入和验收规则见
-[Incremental 专项测试方案](incremental-test-plan.zh-CN.md)。异步物化视图的支持范围和
-生命周期见[异步物化视图使用与实现说明](materialized-view.zh-CN.md)。
+[Incremental 专项测试方案](incremental-test-plan.zh-CN.md)。异步物化视图的 21 个
+真实 Doris Case、五版本执行记录和未覆盖边界见
+[异步物化视图专项测试说明](materialized-view-test-plan.zh-CN.md)，配置和生命周期见
+[异步物化视图使用与实现说明](materialized-view.zh-CN.md)。
 
 ### 5.1 专项用例最低要求
 
