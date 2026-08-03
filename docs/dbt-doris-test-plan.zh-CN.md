@@ -26,8 +26,9 @@
 | 功能测试框架 | `pytest` + `dbt-tests-adapter` |
 | 默认测试库 | `dbt_test`，单副本 |
 
-Doris 版本矩阵覆盖当前维护的 2.1、3.0、3.1、4.0 和 4.1 发布线。新增或删除支持的
-版本时，必须同步修改本表、CI/执行脚本和发布兼容性声明。
+Doris 版本矩阵覆盖上表五个精确发行版本，不代表这些系列当前仍处于维护状态，也
+不自动承诺同系列其他 Patch 版本兼容。新增或删除已验证版本时，必须同步修改本表、
+CI/执行脚本和发布兼容性声明。
 
 ## 3. 总体分层
 
@@ -249,10 +250,13 @@ python -m pytest -q \
 - 当前代码可收集 **327 个单元测试**和 **98 个 Adapter 功能测试**；
 - 98 个功能测试中，**19 个来自 dbt 官方 Adapter 合约**，**79 个为 Doris 专项测试**；
 - 当前 Incremental 文件可收集 **36 个测试**；
-- 已归档的五版本正式执行证据基于较早的干净提交 `fd4a947`：每个 Doris 版本
-  92 个全量功能测试、30 个 Incremental 聚焦测试，以及 324 个单元测试；
-- 后续提交增加了失败边界测试，所以 327/98/36 目前只是新基线的收集结果，必须重新执行
-  五版本矩阵后才能更新为发布通过证据；
+- 新失败边界测试及其五版本正式执行证据绑定干净提交
+  `7f6d9701140188f347e9f68a25ef9013551e4e48`：327 个单元测试
+  通过；每个 Doris 版本均有 98 个全量功能测试和 36 个 Incremental 聚焦测试
+  通过，且精确版本门禁与清理审计通过；
+- Incremental 的目标表模型/物理 Key 前置校验、Schema Change 冻结批次失败重试、
+  Schema Change 超时以及 View Snapshot 后 Replacement/Pre-hook 失败重试已进入
+  当前发布证据，详细结果见专项测试方案；
 - 官方测试下一阶段优先补齐 seed、snapshot、grants、persist docs、constraints、
   unit testing、catalog、hooks 和 relations。
 

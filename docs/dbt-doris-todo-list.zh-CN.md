@@ -159,32 +159,33 @@ View，不作为 Incremental Strategy。
   `test_doris_grants.py`；Unit Test 同时覆盖 DDL、配置校验、Docs、Grants、
   Hook、状态轮询和失败恢复。
 
-附加完成项：
+## P0：跨 Materialization 验证与发布证据
 
 - `persist_docs.relation/columns` 已覆盖 MV Relation/Column Comment，且仅在启用时
   纳入定义 Hash。
 - Doris 专用 Grants 支持显式 `role:<name>`、
   `user:<name>@<host>` Principal，以及 `grants_mode=replace/additive`。
 - 最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现已完成正式矩阵：
-  2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 均为完整 Functional 92 passed、聚焦
-  Incremental 30 passed。各版本 FE/BE 完整 Version 完全一致且 `Alive=true`，
+  2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 均为完整 Functional 98 passed、聚焦
+  Incremental 36 passed。各版本 FE/BE 完整 Version 完全一致且 `Alive=true`，
   测试数据库与 Helper Relation 残留均为 0。
 - Async MV 又在上述五个精确版本直接运行相同的 21 项专项 Functional Test：
   各版本均为 21 passed、无 Skip，耗时依次为 121.07s、118.73s、105.66s、
   105.94s、109.19s；测试后对应数据库残留均为 0。被测 Adapter SHA 为
   `f5e30c64ef7eb8320cf359c3d96cf62b595faf00`，测试开始时 `dirty=false`，环境为
   dbt Core 1.12.0、Python 3.11.15 和 pytest 8.4.2。
-- INC-001、INC-002、INC-053、INC-063、INC-069、INC-071 已补入五版本 E2E；
-  测试计划当前登记的 Incremental 场景全部自动化。
-- 五版本完整 Functional 的 warnings/耗时依次为 `106/114.19s`、
-  `106/116.70s`、`106/117.16s`、`106/120.79s`、`106/111.72s`；聚焦
-  Incremental 依次为 `27/28.48s`、`27/29.45s`、`27/30.53s`、`27/29.01s`、
-  `27/29.92s`。
+- INC-001、INC-002、INC-044、INC-053、INC-056、INC-063、INC-069、INC-071、
+  INC-073 已补入五版本 E2E；INC-057 的三个确定性超时分支已由 Unit 覆盖；测试
+  计划当前登记的 Incremental 场景全部自动化。
+- 五版本完整 Functional 的 warnings/耗时依次为 `106/290.51s`、
+  `106/143.87s`、`106/150.81s`、`106/138.82s`、`106/135.13s`；聚焦
+  Incremental 依次为 `27/45.20s`、`27/52.49s`、`27/43.94s`、`27/39.69s`、
+  `27/39.48s`。
   环境为 dbt Core 1.12.0、Adapter 1.0.0、Python 3.12.13；正式 Adapter SHA 为
-  `fd4a9471d68a0ea4d02cd96875eee3983554c118`、`dirty=false`。每份 Functional
+  `7f6d9701140188f347e9f68a25ef9013551e4e48`、`dirty=false`。每份 Functional
   和聚焦日志开头的 `DORIS_E2E_VERSION_EVIDENCE` JSON 均记录对应
   `expected_release`、完整 `reported_build` 和 `status=passed`。Unit 为
-  324 passed / 9 warnings / 31.28s，Flake8 与 diff check 通过；旧 dirty 工作树
+  327 passed / 9 warnings / 57.99s，Flake8 与 diff check 通过；旧 dirty 工作树
   五版本运行仅作预验证和历史记录。
 - Doris 2.1.11 暴露的当前 Session `sql_mode` 问题已通过 Pre-model Ordering
   修复，并由该版本的聚焦与完整套件验证通过。此前 View DDL 重放和混合集群结果
@@ -278,7 +279,7 @@ View，不作为 Incremental Strategy。
 
 - [x] 在最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现上完成
   Doris 2.1.11、3.0.8、3.1.4、4.0.7 和 4.1.3 的精确版本 E2E；五个版本的完整
-  Functional 92 项与聚焦 Incremental 30 项均通过，节点版本与清理证据符合要求。
+  Functional 98 项与聚焦 Incremental 36 项均通过，节点版本与清理证据符合要求。
 - [ ] SSL、Timeout、Retry 和多 FE Failover。
 - [ ] Query ID、Invocation ID、影响行数和执行耗时。
 - [ ] Doris 服务端 Query Cancel。

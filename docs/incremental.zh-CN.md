@@ -18,21 +18,22 @@ dbt-doris 内置支持三种 Incremental 策略：`append`、`merge` 和
 
 | Doris | FE/BE 完整 Version | 完整 Functional | 聚焦 Incremental | 状态 |
 | --- | --- | --- | --- | --- |
-| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 92 passed / 106 warnings / 114.19s | 30 passed / 27 warnings / 28.48s | 已验证 |
-| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 92 passed / 106 warnings / 116.70s | 30 passed / 27 warnings / 29.45s | 已验证 |
-| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 92 passed / 106 warnings / 117.16s | 30 passed / 27 warnings / 30.53s | 已验证 |
-| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 92 passed / 106 warnings / 120.79s | 30 passed / 27 warnings / 29.01s | 已验证 |
-| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 92 passed / 106 warnings / 111.72s | 30 passed / 27 warnings / 29.92s | 已验证 |
+| 2.1.11 | `doris-2.1.11-rc01-97b77e6cda` | 98 passed / 106 warnings / 290.51s | 36 passed / 27 warnings / 45.20s | 已验证 |
+| 3.0.8 | `doris-3.0.8-rc01-09b0cc49a6` | 98 passed / 106 warnings / 143.87s | 36 passed / 27 warnings / 52.49s | 已验证 |
+| 3.1.4 | `doris-3.1.4-rc02-7f5ba43de6` | 98 passed / 106 warnings / 150.81s | 36 passed / 27 warnings / 43.94s | 已验证 |
+| 4.0.7 | `doris-4.0.7-rc02-35854e7e92a` | 98 passed / 106 warnings / 138.82s | 36 passed / 27 warnings / 39.69s | 已验证 |
+| 4.1.3 | `doris-4.1.3-rc02-7126cf65d96` | 98 passed / 106 warnings / 135.13s | 36 passed / 27 warnings / 39.48s | 已验证 |
 
 五个版本都覆盖 `append`、MOW/MOR `merge`、可见 Sequence 列、整表/静态分区/
-动态分区 `insert_overwrite`、Schema Change、Full Refresh、默认策略路由、Hook
-失败与重试，以及临时/备份对象清理。每个版本的 FE/BE 完整 Version 一致且
-`Alive=true`，测试数据库和 Helper Relation 残留均为 0。
+动态分区 `insert_overwrite`、Schema Change、Full Refresh、默认策略路由、现有
+目标表模型与物理 Key 前置校验、Schema Change 冻结批次失败重试、View Snapshot
+后的 Replacement/Pre-hook 失败重试，以及临时/备份对象清理。每个版本的 FE/BE
+完整 Version 一致且 `Alive=true`，测试数据库和 Helper Relation 残留均为 0。
 
 验证环境是 dbt Core 1.12.0、dbt-doris 1.0.0、Python 3.12.13；被测 Adapter
-提交为 `fd4a9471d68a0ea4d02cd96875eee3983554c118`，`dirty=false`。每份测试日志
+提交为 `7f6d9701140188f347e9f68a25ef9013551e4e48`，`dirty=false`。每份测试日志
 开头的 `DORIS_E2E_VERSION_EVIDENCE` JSON 都记录了目标发行版、实际 FE/BE
-Build、Gate 状态和 Adapter 身份。Unit 为 324 passed / 9 warnings / 31.28s，
+Build、Gate 状态和 Adapter 身份。Unit 为 327 passed / 9 warnings / 57.99s，
 Flake8 与 diff check 通过。
 
 安装约束是 Python 3.10+ 和 dbt Core 1.12.x；上表的正式矩阵使用 Python 3.12.13
