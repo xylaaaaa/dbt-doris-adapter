@@ -106,7 +106,7 @@
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
   {# Doris DML is not rolled back if a later grant validation fails. Validate
-     grant syntax, mode and principal existence before changing target data. #}
+     privileges and user existence before changing target data. #}
   {% do doris__preflight_grants(target_relation, grant_config) %}
 
   {% set to_drop = [] %}
@@ -135,22 +135,41 @@
       ) %}
   {% endif %}
 
+  {% set build_sql = none %}
   {% if existing_relation is none %}
-      {% set build_sql = doris__get_incremental_create_table_as_sql(
-          effective_strategy,
-          target_relation,
-          source_sql,
-          source_columns
-      ) %}
+      {% if config.persist_column_docs() %}
+          {% do doris__create_incremental_documented_table(
+              effective_strategy,
+              target_relation,
+              source_sql,
+              source_columns
+          ) %}
+      {% else %}
+          {% set build_sql = doris__get_incremental_create_table_as_sql(
+              effective_strategy,
+              target_relation,
+              source_sql,
+              source_columns
+          ) %}
+      {% endif %}
       {% set relation_for_indexes = target_relation %}
 
   {% elif full_refresh_mode %}
-      {% set build_sql = doris__get_incremental_create_table_as_sql(
-          effective_strategy,
-          intermediate_relation,
-          source_sql,
-          source_columns
-      ) %}
+      {% if config.persist_column_docs() %}
+          {% do doris__create_incremental_documented_table(
+              effective_strategy,
+              intermediate_relation,
+              source_sql,
+              source_columns
+          ) %}
+      {% else %}
+          {% set build_sql = doris__get_incremental_create_table_as_sql(
+              effective_strategy,
+              intermediate_relation,
+              source_sql,
+              source_columns
+          ) %}
+      {% endif %}
       {% set relation_for_indexes = intermediate_relation %}
       {% set need_swap = true %}
 
@@ -279,9 +298,11 @@
       {% set build_sql = strategy_sql_macro_func(strategy_arg_dict) %}
   {% endif %}
 
-  {% call statement('main') %}
-      {{ build_sql }}
-  {% endcall %}
+  {% if build_sql is not none %}
+      {% call statement('main') %}
+          {{ build_sql }}
+      {% endcall %}
+  {% endif %}
 
   {% if existing_relation is none or full_refresh_mode %}
       {% do create_indexes(relation_for_indexes) %}
@@ -367,6 +388,35 @@
         false,
         true
     )) }}
+{% endmacro %}
+
+
+{% macro doris__create_incremental_documented_table(
+    strategy,
+    relation,
+    sql,
+    source_columns=none
+) %}
+    {% set prepared_sql = sql %}
+    {% if strategy == 'merge' %}
+        {% set ordered_source_columns = doris__unique_key_first_columns(
+            source_columns,
+            config.get('unique_key')
+        ) %}
+        {% set prepared_sql = doris__validated_unique_ctas_source_sql(
+            sql,
+            config.get('unique_key'),
+            ordered_source_columns
+        ) %}
+    {% endif %}
+    {% do doris__create_documented_table_as(
+        false,
+        relation,
+        prepared_sql,
+        strategy == 'merge',
+        false,
+        true
+    ) %}
 {% endmacro %}
 
 

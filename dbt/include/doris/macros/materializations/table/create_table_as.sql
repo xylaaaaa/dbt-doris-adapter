@@ -84,7 +84,14 @@
 {%- endmacro %}
 
 
-{% macro doris__create_documented_table_as(temporary, relation, sql, unique=false) -%}
+{% macro doris__create_documented_table_as(
+    temporary,
+    relation,
+    sql,
+    unique=false,
+    include_sql_header=true,
+    sql_is_prepared=false
+) -%}
     {#-- Doris CTAS cannot declare column comments. Build the query once in a
          private source table, read Doris' exact inferred types, then create the
          final staging table with inline comments and copy the rows. Inline
@@ -97,7 +104,13 @@
     {% do doris__drop_relation(source_relation) %}
 
     {% call statement('create_documented_table_source') %}
-        {{ doris__create_table_as(temporary, source_relation, sql) }}
+        {{ doris__create_table_as(
+            temporary,
+            source_relation,
+            sql,
+            include_sql_header,
+            sql_is_prepared
+        ) }}
     {% endcall %}
 
     {%- set source_columns = adapter.get_columns_in_relation(source_relation) -%}
@@ -120,7 +133,13 @@
         {{ doris__table_comment() }}
         {{ doris__partition_by() }}
         {{ doris__distributed_by() }}
-        {{ doris__properties() }}
+        {% if unique %}
+            {{ doris__properties({
+                'enable_unique_key_merge_on_write': 'true'
+            }) }}
+        {% else %}
+            {{ doris__properties() }}
+        {% endif %}
     {% endcall %}
 
     {% call statement('main') %}
