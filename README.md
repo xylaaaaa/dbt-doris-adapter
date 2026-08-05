@@ -334,27 +334,24 @@ relation description is included in the MV comment only when
 remains in that comment independently. Column descriptions are rendered in the
 MV column definitions when `persist_docs.columns` is enabled.
 
-Doris relation grants require explicit principals:
+Doris relation grants manage Doris users through dbt's standard `grants`
+configuration:
 
 ```yaml
 models:
   your_project:
     +grants:
       select:
-        - "role:analyst"
-        - "user:reporter@%"
-    +grants_mode: replace
+        - "analyst"
+        - "reporter@%"
 ```
 
-Before any materialized-view DDL, the adapter validates every configured
-principal so an invalid User or Role cannot expose a new MV definition or leave
-partial grants. `grants_mode: replace` converges direct relation grants by
-revoking stale entries; `additive` only adds configured privileges. User
-identities must use
-`user:<name>@<host>` (or `user:<name>@[<domain>]`) and roles must use
-`role:<name>`, so the adapter never guesses whether a bare name is a User or a
-Role. Managing grants requires an execution identity that can read `SHOW ROLES`
-and administer privileges on the target relation.
+Before materialized-view DDL or incremental DML, the adapter validates every
+configured privilege and user so an invalid grant cannot expose a new MV
+definition or leave partially written incremental data. A bare name means
+`username@%`; use `username@host` for a host-specific identity. Doris roles are
+not supported because `information_schema.table_privileges` cannot distinguish
+direct user grants from inherited role grants safely.
 
 Asynchronous-MV version evidence is:
 

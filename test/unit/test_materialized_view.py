@@ -815,7 +815,7 @@ def test_invalid_grants_fail_before_definition_inspection_or_target_ddl():
         existing_relation=existing,
         config={
             "build_mode": "deferred",
-            "grants": {"select": ["role:missing"]},
+            "grants": {"select": ["missing_user"]},
         },
         fail_grant_preflight=True,
     )
@@ -830,7 +830,7 @@ def test_invalid_grants_fail_before_definition_inspection_or_target_ddl():
     assert ("version", "doris-4.1.2-test") in adapter.timeline
     assert (
         "grants_preflight",
-        {"select": ["role:missing"]},
+        {"select": ["missing_user"]},
     ) in adapter.timeline
     assert not any(
         event[0] == "query"

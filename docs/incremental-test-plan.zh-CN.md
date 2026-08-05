@@ -357,7 +357,7 @@ AS SELECT * FROM source_view;
 | INC-067 | 当前 Session SQL Mode + 首列 DOUBLE | 以 Pre-model Session 实际查询结果为准；Snapshot 后再运行新模型 `sql_header`；不声称保留创建模式 | 2.1.11 发现已修复；五版本完整与聚焦套件均通过 |
 | INC-068 | Generic View Rename/Exchange | 在破坏性 SQL 前明确拒绝 | 已覆盖 |
 | INC-069 | View Snapshot Helper 前置条件 | 源/目标同名时零 SQL；目标已存在时只允许只读元数据查询；两者均零修改 SQL、零 Drop | Unit 与五版本 E2E 已覆盖 |
-| INC-070 | 无效 Grants | Principal/Mode 校验先于目标 DML，目标数据不变 | 已覆盖 |
+| INC-070 | 无效 Grants | 权限名与用户校验先于目标 DML，目标数据不变 | 已覆盖 |
 | INC-071 | Pre/Post Hook 失败 | Pre 失败零 staging/DML；Post 失败后 DML 可见、逻辑 View 保留；Retry 先清理并收敛 | 五版本 E2E 已覆盖 |
 | INC-072 | Persistent Backup Marker 三轮运行 | Incremental/Partition 连续失败不发布 Canonical、不触碰 Backup；成功完整构建后才清理 | 真实 Doris E2E 已覆盖 |
 | INC-073 | View Snapshot 后 Replacement Build 或 Pre-hook 失败 | Snapshot 先完成；旧 View 在线、物理 Backup 保留、零目标 DML；Pre-hook 失败时 Replacement CTAS 尚未开始；修正模型后 Retry 成功并清理 Helper | 两种失败分支经五版本 E2E 覆盖 |
@@ -380,7 +380,7 @@ AS SELECT * FROM source_view;
 
 - 缺失 Source Relation；
 - 重复 Key；
-- 不存在的 Grant Role/User；
+- 不存在的 Grant User；
 - Doris Schema Change Job `CANCELLED`，以及新 Job `RUNNING`、旧完成 Job 仍可见、
   最新 Job 暂不可见三类超时；
 - Schema Change 已完成 ALTER 后，带重复 Key Guard 的目标 DML 因 JSON Parse

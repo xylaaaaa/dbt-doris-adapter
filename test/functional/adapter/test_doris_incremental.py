@@ -787,7 +787,7 @@ INCREMENTAL_INVALID_GRANTS_SQL = """
     incremental_strategy='append',
     duplicate_key=['id'],
     distributed_by=['id'],
-    grants={'select': ['role:dbt_incremental_definitely_missing_role']},
+    grants={'select': ['dbt_incremental_definitely_missing_user']},
     properties={'replication_num': '1'}
 ) }}
 
@@ -1524,7 +1524,7 @@ class TestDorisIncrementalGrantPreflight:
             expect_pass=False,
         )
         assert len(failure.results) == 1
-        assert "do not exist" in failure.results[0].message.lower()
+        assert "does not exist" in failure.results[0].message.lower()
         assert not any("insert into" in statement for statement in statements)
         assert project.run_sql(
             f"select id, value from {relation}",

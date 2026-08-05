@@ -504,11 +504,10 @@ Adapter Response 包含 Task ID、Status 和可用的 Last Query ID。关闭等�
 `persist_docs.columns` 通过 CREATE MV 完整列定义写入 Column Comment。只有启用
 的 Description 会进入定义 Hash。
 
-Doris 专用 Grants 使用显式 `role:<name>`、`user:<name>@<host>` Principal；
-`grants_mode=replace` 收敛直接 Relation Grants，`additive` 只增加授权。项目级
-`+grants` 可用于 MV，不再硬失败，也不会回收 Global/Database 等继承权限。
-所有 Principal 在 MV DDL 前一次性校验，避免无效 Principal 暴露新定义或留下
-部分授权；User 按大小写精确比较，Role 和 Host 按 Doris 语义比较。
+Doris Grants 使用用户名或 `username@host`，裸用户名表示 `username@%`。项目级
+`+grants` 可用于 MV；所有权限名和用户会在 MV DDL 前校验，避免无效授权暴露
+新定义。当前不支持 Role，因为 `information_schema.table_privileges` 无法安全
+区分用户直接授权和从 Role 继承的授权。
 
 Outside Pre-hook 通常在 `SHOW CREATE` 和配置漂移检查前执行；Active Canonical
 View 类型替换是安全例外，物理 Snapshot 必须早于 Outside/Inside Pre-hook、
@@ -567,7 +566,7 @@ dev BE 混合集群结果仅作历史记录。2.1.11 曾暴露旧 View 查询依
   `BUILD DEFERRED + MANUAL` 第二次运行刷新；
 - Key、Partition、Distribution、Buckets、Properties 和 `replication_num`；
 - 定义 Hash、幂等运行、`on_configuration_change`、Full Refresh 和原子替换；
-- Relation/Column Persist Docs、Doris User/Role Grants 和 Hook 顺序；
+- Relation/Column Persist Docs、Doris User Grants 和 Hook 顺序；
 - Unit Test、dbt 官方 Materialized View Contract Test、Doris Functional Test
   与用户文档。
 
@@ -724,7 +723,7 @@ ON COMMIT
 | Refresh 分流 | 只由 `refresh_trigger` 决定，不提供 `refresh_on_run` |
 | 分区选择 | 由 Doris 按 MV 定义和 Refresh Method 管理；Adapter 不指定分区 |
 | Docs | 支持 `persist_docs.relation` 与 `persist_docs.columns` |
-| Grants | 显式 User/Role Principal；Replace 或 Additive |
+| Grants | 用户名或 `username@host`；Role 暂不支持 |
 | Doris 版本验证 | 2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 的正式版本矩阵均 passed；旧实现和开发混合集群结果仅作历史诊断 |
 | 普通 View 类型切换 | Active Canonical View 正向 Snapshot 先于新模型 Hook/Header/DDL，旧 View 在线到 Replacement Build 完成；Incremental/Partition 使用 Durable No-restore Marker，Table/MV 先恢复 Canonical；Generic View Rename/Exchange 拒绝 |
 | Doris 版本 Gate | 当前代码接受 2.x >= 2.1.5、3.x 排除 3.0.0、主版本 >= 4；这是运行条件，不是兼容性矩阵 |

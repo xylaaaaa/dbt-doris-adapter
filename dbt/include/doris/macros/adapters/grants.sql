@@ -67,7 +67,7 @@
 
 {% macro doris__preflight_grants(relation, grant_config) -%}
     {# Doris DCL is non-transactional. Validate privileges and principals before
-       an MV replacement can expose a new definition. #}
+       a materialization changes the target relation. #}
     {%- if not grant_config -%}
         {{ return(none) }}
     {%- endif -%}

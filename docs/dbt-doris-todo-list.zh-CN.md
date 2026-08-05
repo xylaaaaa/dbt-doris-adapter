@@ -163,8 +163,8 @@ View，不作为 Incremental Strategy。
 
 - `persist_docs.relation/columns` 已覆盖 MV Relation/Column Comment，且仅在启用时
   纳入定义 Hash。
-- Doris 专用 Grants 支持显式 `role:<name>`、
-  `user:<name>@<host>` Principal，以及 `grants_mode=replace/additive`。
+- Doris Grants 支持用户名和 `username@host`，并在写入前校验权限名与用户；
+  Role 暂不支持，避免将继承权限误当作用户直接授权进行回收。
 - 最终 CTAS Snapshot + Durable Marker + Pre-model Ordering 实现已完成正式矩阵：
   2.1.11、3.0.8、3.1.4、4.0.7、4.1.3 均为完整 Functional 98 passed、聚焦
   Incremental 36 passed。各版本 FE/BE 完整 Version 完全一致且 `Alive=true`，

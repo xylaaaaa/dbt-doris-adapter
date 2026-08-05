@@ -30,7 +30,6 @@ from typing import (
     FrozenSet,
     List,
     Optional,
-    Set,
     Tuple,
     Union,
 )
@@ -50,17 +49,6 @@ from dbt_common.clients.agate_helper import table_from_rows
 from dbt.adapters.doris.doris_column_item import DorisColumnItem
 
 
-_DORIS_DEFAULT_ROLE_PREFIX = "default_role_rbac_"
-_DORIS_ROLE_PRIVILEGE_TO_DBT = {
-    "select_priv": "select",
-    "load_priv": "insert",
-}
-_DORIS_USER_IDENTITY = re.compile(
-    r"^'(?P<user>[^']+)'@(?:'(?P<host>[^']+)'|\['(?P<domain>[^']+)'\])$"
-)
-_DORIS_DBT_USER_PRINCIPAL = re.compile(
-    r"^user:(?P<user>[^@]+)@(?P<host>.+)$"
-)
 _DORIS_VERSION = re.compile(
     r"(?:^|doris-)(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
 )
@@ -73,188 +61,6 @@ class DorisMaterializedViewAdapterResponse(AdapterResponse):
     task_id: Optional[str] = None
     task_status: Optional[str] = None
     task_error: Optional[str] = None
-
-
-def _doris_grantee_from_role_row(role_name: str, users: Optional[str]) -> str:
-    """Return the explicit dbt-doris principal represented by a SHOW ROLES row."""
-    if not role_name.startswith(_DORIS_DEFAULT_ROLE_PREFIX):
-        return f"role:{role_name}"
-
-    match = _DORIS_USER_IDENTITY.fullmatch(users or "")
-    if match is None:
-        raise dbt.exceptions.DbtRuntimeError(
-            "Could not identify the Doris user represented by default role "
-            f"{role_name!r}."
-        )
-
-    host = match.group("host")
-    if host is not None:
-        return f"user:{match.group('user')}@{host}"
-    return f"user:{match.group('user')}@[{match.group('domain')}]"
-
-
-def _doris_grantee_key(grantee: str) -> Tuple[str, ...]:
-    """Return a key matching Doris principal case-sensitivity rules.
-
-    Doris Role and Host names are case-insensitive, while User names are
-    case-sensitive. Domain identities remain distinct from ordinary Host
-    identities even when their text is otherwise identical.
-    """
-    if grantee.startswith("role:") and grantee[5:]:
-        return ("role", grantee[5:].casefold())
-
-    match = _DORIS_DBT_USER_PRINCIPAL.fullmatch(grantee)
-    if match is not None:
-        host = match.group("host")
-        is_domain = host.startswith("[") and host.endswith("]")
-        if is_domain:
-            host = host[1:-1]
-        if host:
-            return (
-                "user",
-                match.group("user"),
-                "domain" if is_domain else "host",
-                host.casefold(),
-            )
-
-    raise dbt.exceptions.DbtRuntimeError(
-        "Invalid Doris grant principal "
-        f"{grantee!r}; expected role:<name> or user:<name>@<host>."
-    )
-
-
-def _diff_doris_grants_dict(
-        grants: Dict[str, List[str]],
-        reference_grants: Dict[str, List[str]],
-) -> Dict[str, List[str]]:
-    """Return grants absent from a reference using Doris case semantics."""
-    reference_keys: Dict[str, Set[Tuple[str, ...]]] = {}
-    for privilege, grantees in reference_grants.items():
-        normalized_privilege = str(privilege).casefold()
-        reference_keys.setdefault(normalized_privilege, set()).update(
-            _doris_grantee_key(grantee) for grantee in grantees
-        )
-
-    difference: Dict[str, List[str]] = {}
-    difference_keys: Dict[str, Set[Tuple[str, ...]]] = {}
-    for privilege, grantees in grants.items():
-        normalized_privilege = str(privilege).casefold()
-        known_keys = reference_keys.get(normalized_privilege, set())
-        emitted_keys = difference_keys.setdefault(normalized_privilege, set())
-        for grantee in grantees:
-            grantee_key = _doris_grantee_key(grantee)
-            if grantee_key in known_keys or grantee_key in emitted_keys:
-                continue
-            difference.setdefault(normalized_privilege, []).append(grantee)
-            emitted_keys.add(grantee_key)
-
-    return difference
-
-
-def _standardize_doris_grants_dict(
-        roles_table: agate.Table, relation: BaseRelation
-) -> Dict[str, List[str]]:
-    """Normalize direct User and Role grants from ``SHOW ROLES``.
-
-    Doris represents privileges granted directly to a User in an internal
-    ``default_role_rbac_*`` role. Reading ``information_schema.table_privileges``
-    is not sufficient because that view expands inherited Role privileges into
-    one row per User. ``SHOW ROLES`` with ``show_user_default_role=true`` keeps
-    the two sources distinct and makes revocation safe.
-    """
-    if relation.schema is None or relation.identifier is None:
-        raise dbt.exceptions.DbtRuntimeError(
-            "Doris grants require a relation with both schema and identifier."
-        )
-
-    target = f"internal.{relation.schema}.{relation.identifier}"
-    grants: Dict[str, List[str]] = {}
-
-    for row in roles_table:
-        table_privileges = row["TablePrivs"]
-        if not table_privileges:
-            continue
-
-        for entry in table_privileges.split("; "):
-            try:
-                object_name, privilege_list = entry.rsplit(": ", 1)
-            except ValueError as exc:
-                raise dbt.exceptions.DbtRuntimeError(
-                    f"Could not parse Doris TablePrivs entry {entry!r}."
-                ) from exc
-
-            if object_name != target:
-                continue
-
-            managed_privileges = [
-                _DORIS_ROLE_PRIVILEGE_TO_DBT[doris_privilege]
-                for doris_privilege in (
-                    privilege.strip().casefold()
-                    for privilege in privilege_list.split(",")
-                )
-                if doris_privilege in _DORIS_ROLE_PRIVILEGE_TO_DBT
-            ]
-            if not managed_privileges:
-                continue
-
-            grantee = _doris_grantee_from_role_row(row["Name"], row["Users"])
-            for dbt_privilege in managed_privileges:
-                grants.setdefault(dbt_privilege, []).append(grantee)
-
-    standardized: Dict[str, List[str]] = {}
-    for privilege, grantees in grants.items():
-        unique_grantees: Dict[Tuple[str, ...], str] = {}
-        for grantee in grantees:
-            unique_grantees.setdefault(_doris_grantee_key(grantee), grantee)
-        standardized[privilege] = sorted(
-            unique_grantees.values(),
-            key=lambda grantee: (_doris_grantee_key(grantee), grantee),
-        )
-    return standardized
-
-
-def _validate_doris_grantees_exist(
-        roles_table: agate.Table,
-        grant_config: Dict[str, List[str]],
-) -> None:
-    """Validate all requested principals before mutating non-transactional DCL."""
-    existing_grantees = set()
-    for row in roles_table:
-        role_name = str(row["Name"])
-        if not role_name.startswith(_DORIS_DEFAULT_ROLE_PREFIX):
-            existing_grantees.add(_doris_grantee_key(f"role:{role_name}"))
-            continue
-
-        match = _DORIS_USER_IDENTITY.fullmatch(str(row["Users"] or ""))
-        if match is None:
-            continue
-        host = match.group("host")
-        if host is not None:
-            grantee = f"user:{match.group('user')}@{host}"
-        else:
-            grantee = (
-                f"user:{match.group('user')}@[{match.group('domain')}]"
-            )
-        existing_grantees.add(_doris_grantee_key(grantee))
-
-    requested_grantees = {
-        grantee
-        for grantees in grant_config.values()
-        for grantee in grantees
-    }
-    missing_grantees = sorted(
-        (
-            grantee
-            for grantee in requested_grantees
-            if _doris_grantee_key(grantee) not in existing_grantees
-        ),
-        key=lambda grantee: (grantee.casefold(), grantee),
-    )
-    if missing_grantees:
-        raise dbt.exceptions.DbtRuntimeError(
-            "The following Doris grant principals do not exist: "
-            f"{', '.join(missing_grantees)}. No privileges were changed."
-        )
 
 
 def _validate_doris_materialized_view_version(
@@ -349,8 +155,6 @@ class DorisConfig(AdapterConfig):
     wait_for_refresh: bool = True
     refresh_wait_timeout: int = 300
     refresh_poll_interval: int = 1
-
-    grants_mode: str = "replace"
 
 
 class DorisAdapter(SQLAdapter):
@@ -473,28 +277,6 @@ class DorisAdapter(SQLAdapter):
                     )
                 )
             time.sleep(0.2)
-
-    @available
-    def standardize_doris_grants_dict(
-            self, roles_table: agate.Table, relation: BaseRelation
-    ) -> Dict[str, List[str]]:
-        return _standardize_doris_grants_dict(roles_table, relation)
-
-    @available
-    def diff_doris_grants_dict(
-            self,
-            grants: Dict[str, List[str]],
-            reference_grants: Dict[str, List[str]],
-    ) -> Dict[str, List[str]]:
-        return _diff_doris_grants_dict(grants, reference_grants)
-
-    @available
-    def validate_doris_grantees_exist(
-            self,
-            roles_table: agate.Table,
-            grant_config: Dict[str, List[str]],
-    ) -> None:
-        _validate_doris_grantees_exist(roles_table, grant_config)
 
     @available
     def materialized_view_adapter_response(
